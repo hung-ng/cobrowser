@@ -1,0 +1,22 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+.DS_Store
+# Local maintainer files
+/AGENTS.md
+/CLAUDE.md
+/STATUS.md
+/TODO.md
+/PROGRESS.md
+/PLAN.md
+/.private/
+/.agents/
+/.claude/
+/.codex/
+/docs/*
+!/docs/testing.md
+/docs/decisions.md
+/docs/research/arc-agent-options.md
+/docs/spec.md
+/docs/status.md
