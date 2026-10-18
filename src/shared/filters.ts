@@ -7,6 +7,7 @@ export interface TabInfo {
   lastAccessed?: number;
   openedAt?: number;
   discarded?: boolean;
+  status?: string;
   incognito?: boolean;
   denied?: boolean;
 }
@@ -20,7 +21,7 @@ export interface TabFilter {
 }
 
 export function filterTabs(tabs: TabInfo[], filter: TabFilter, frontWindowId?: number): TabInfo[] {
-  const words = (filter.match ?? '').trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  const words = (filter.match ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean);
   const now = filter.now ?? Date.now();
   const cutoff = filter.sinceMs === undefined ? undefined : now - filter.sinceMs;
   return tabs
@@ -33,9 +34,7 @@ export function filterTabs(tabs: TabInfo[], filter: TabFilter, frontWindowId?: n
     )
     .filter((tab) => !filter.active || tab.active)
     .filter((tab) => cutoff === undefined || (tab.openedAt !== undefined && tab.openedAt >= cutoff))
-    .filter((tab) =>
-      words.every((word) => `${tab.title} ${tab.url}`.toLocaleLowerCase().includes(word)),
-    )
+    .filter((tab) => words.every((word) => `${tab.title} ${tab.url}`.toLowerCase().includes(word)))
     .sort((a, b) => {
       if (a.openedAt !== undefined && b.openedAt !== undefined && a.openedAt !== b.openedAt)
         return b.openedAt - a.openedAt;

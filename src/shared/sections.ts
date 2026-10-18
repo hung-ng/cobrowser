@@ -7,6 +7,16 @@ export interface SectionNode {
   children: SectionNode[];
 }
 
+export const MAX_SECTION_NUMBER_CHARS = 256;
+
+export function isSectionNumber(value: unknown): boolean {
+  if (typeof value !== 'string' && typeof value !== 'number') return false;
+  const text = String(value);
+  return (
+    text.length <= MAX_SECTION_NUMBER_CHARS && /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))*$/.test(text)
+  );
+}
+
 function wordsOf(text: string): number {
   return text.trim() ? text.trim().split(/\s+/).length : 0;
 }

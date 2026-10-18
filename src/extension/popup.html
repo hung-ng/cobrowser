@@ -1,5 +1,42 @@
-<!doctype html><meta charset="utf-8" /><title>cobrowser</title>
-<p id="status">connecting</p>
-<label><input id="paused" type="checkbox" /> pause reads</label>
-<p><a href="options.html" target="_blank">denylist</a></p>
-<script src="popup.js"></script>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cobrowser</title>
+    <style>
+      body {
+        min-width: 250px;
+        margin: 16px;
+        font:
+          13px system-ui,
+          sans-serif;
+      }
+      #status {
+        color: #555;
+        overflow-wrap: anywhere;
+      }
+      :focus-visible {
+        outline: 2px solid #2563eb;
+        outline-offset: 2px;
+      }
+      label {
+        display: block;
+        margin: 12px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>cobrowser</h1>
+      <p id="status" role="status" aria-live="polite">connecting</p>
+      <label for="paused"><input id="paused" type="checkbox" /> pause reads</label>
+      <p><a href="options.html" target="_blank">Edit the denylist</a></p>
+      <h2>Recent reads</h2>
+      <ul id="recent">
+        <li>None yet.</li>
+      </ul>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

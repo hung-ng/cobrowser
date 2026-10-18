@@ -2,7 +2,9 @@ export const MAX_HELPER_FRAME = 1_000_000;
 export const MAX_EXTENSION_FRAME = 64 * 1024 * 1024;
 
 export function encodeFrame(value: unknown, maxLength = MAX_EXTENSION_FRAME): Buffer {
-  const body = Buffer.from(JSON.stringify(value), 'utf8');
+  const serialized = JSON.stringify(value);
+  if (typeof serialized !== 'string') throw new Error('native message must be JSON-serializable');
+  const body = Buffer.from(serialized, 'utf8');
   if (body.length > maxLength) throw new Error('native message is too large');
   const header = Buffer.allocUnsafe(4);
   header.writeUInt32LE(body.length, 0);
