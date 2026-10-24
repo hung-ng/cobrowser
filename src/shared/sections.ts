@@ -1,3 +1,5 @@
+import { markdownHeadings } from './headings.js';
+
 export interface SectionNode {
   number: string;
   title: string;
@@ -25,27 +27,25 @@ export function buildSectionTree(markdown: string): SectionNode[] {
   const lines = markdown.replace(/\r\n/g, '\n').split('\n');
   const roots: SectionNode[] = [];
   const stack: SectionNode[] = [];
+  const headings = markdownHeadings(markdown);
   let preamble = '';
-  const append = (node: SectionNode) => {
-    while (stack.length && stack[stack.length - 1].level >= node.level) stack.pop();
-    if (stack.length) stack[stack.length - 1].children.push(node);
-    else roots.push(node);
-    stack.push(node);
-  };
-  for (const line of lines) {
-    const match = /^(#{1,3})\s+(.+?)\s*$/.exec(line);
-    if (!match) {
+  for (const [index, line] of lines.entries()) {
+    const heading = headings.get(index);
+    if (!heading) {
       if (stack.length)
         stack[stack.length - 1].text += `${stack[stack.length - 1].text ? '\n' : ''}${line}`;
       else preamble += `${preamble ? '\n' : ''}${line}`;
       continue;
     }
-    const level = match[1].length;
-    const parent =
-      stack.length && stack[stack.length - 1].level < level ? stack[stack.length - 1] : undefined;
+    const { level, title } = heading;
+    while (stack.length && stack[stack.length - 1].level >= level) stack.pop();
+    const parent = stack[stack.length - 1];
     const siblingCount = parent ? parent.children.length + 1 : roots.length + 1;
     const number = parent ? `${parent.number}.${siblingCount}` : String(siblingCount);
-    append({ number, title: match[2], level, text: '', words: 0, children: [] });
+    const node = { number, title, level, text: line, words: 0, children: [] };
+    if (parent) parent.children.push(node);
+    else roots.push(node);
+    stack.push(node);
   }
   if (preamble.trim())
     roots.unshift({
@@ -56,9 +56,9 @@ export function buildSectionTree(markdown: string): SectionNode[] {
       words: wordsOf(preamble),
       children: [],
     });
-  const finalize = (node: SectionNode, inherited = '') => {
+  const finalize = (node: SectionNode) => {
     const own = node.text.trim();
-    const childText = node.children.map((child) => finalize(child, inherited)).join('\n\n');
+    const childText = node.children.map((child) => finalize(child)).join('\n\n');
     node.text = [own, childText].filter(Boolean).join('\n\n');
     node.words = wordsOf(node.text);
     return node.text;

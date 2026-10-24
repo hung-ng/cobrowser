@@ -18,7 +18,7 @@ export interface PageSnapshot {
   feed?: boolean;
   canvas?: boolean;
   reloaded?: boolean;
-  special?: { kind: SpecialKind; text?: string; base64?: string };
+  special?: { kind: SpecialKind; text?: string; base64?: string; sourceUrls?: string[] };
 }
 
 export interface ConvertedPage {
@@ -62,12 +62,7 @@ export function convertSnapshot(snapshot: PageSnapshot, full = false): Converted
     codeBlockStyle: 'fenced',
   });
   turndown.use(gfm);
-  let markdown = stripUnsafeControls(
-    turndown
-      .turndown(content)
-      .replace(/\n{3,}/g, '\n\n')
-      .trim(),
-  );
+  let markdown = stripUnsafeControls(turndown.turndown(content).trim());
   markdown = markdown.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_, alt: string) =>
     alt ? `[image: ${alt}]` : '',
   );
@@ -97,6 +92,18 @@ export function convertSnapshot(snapshot: PageSnapshot, full = false): Converted
   };
 }
 
+function pdfString(bytes: Buffer): string {
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    const swapped = Buffer.alloc(bytes.length - 2);
+    for (let index = 2; index + 1 < bytes.length; index += 2) {
+      swapped[index - 2] = bytes[index + 1];
+      swapped[index - 1] = bytes[index];
+    }
+    return swapped.toString('utf16le');
+  }
+  return bytes.toString('latin1');
+}
+
 function pdfLiteral(value: string): string {
   const escapes: Record<string, string> = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f' };
   let result = '';
@@ -122,20 +129,12 @@ function pdfLiteral(value: string): string {
     result += (next && escapes[next]) || next || '\\';
     if (next) index++;
   }
-  return result;
+  return pdfString(Buffer.from(result, 'latin1'));
 }
 
 function pdfHex(value: string): string {
-  const bytes = Buffer.from(value.length % 2 ? `${value}0` : value, 'hex');
-  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
-    const swapped = Buffer.alloc(bytes.length - 2);
-    for (let index = 2; index + 1 < bytes.length; index += 2) {
-      swapped[index - 2] = bytes[index + 1];
-      swapped[index - 1] = bytes[index];
-    }
-    return swapped.toString('utf16le');
-  }
-  return bytes.toString('latin1');
+  value = value.replace(/\s/g, '');
+  return pdfString(Buffer.from(value.length % 2 ? `${value}0` : value, 'hex'));
 }
 
 type PdfToken =
@@ -159,15 +158,15 @@ function pdfTokens(
     }
     if (stopAtArrayEnd && char === ']') return { tokens, next: index + 1 };
     if (char === '%') {
-      const end = source.indexOf('\n', index + 1);
-      index = end < 0 ? source.length : end + 1;
+      const end = source.slice(index + 1).search(/[\r\n]/);
+      index = end < 0 ? source.length : index + end + 2;
       continue;
     }
     if (char === '(') {
-      let depth = 1;
+      let literalDepth = 1;
       let value = '';
       index++;
-      while (index < source.length && depth > 0) {
+      while (index < source.length && literalDepth > 0) {
         const current = source[index];
         if (current === '\\') {
           value += current;
@@ -175,10 +174,10 @@ function pdfTokens(
           if (index < source.length) value += source[index++];
           continue;
         }
-        if (current === '(') depth++;
+        if (current === '(') literalDepth++;
         else if (current === ')') {
-          depth--;
-          if (!depth) {
+          literalDepth--;
+          if (!literalDepth) {
             index++;
             break;
           }
@@ -197,20 +196,18 @@ function pdfTokens(
         continue;
       }
     }
-    if (char === '<' && source[index + 1] === '<') {
-      tokens.push({ kind: 'word', value: '<<' });
-      index += 2;
-      continue;
-    }
-    if (char === '>' && source[index + 1] === '>') {
-      tokens.push({ kind: 'word', value: '>>' });
+    if ((char === '<' || char === '>') && source[index + 1] === char) {
+      tokens.push({ kind: 'word', value: char + char });
       index += 2;
       continue;
     }
     if (char === '[') {
       if (depth >= MAX_PDF_ARRAY_DEPTH) {
-        const end = source.indexOf(']', index + 1);
-        index = end < 0 ? source.length : end + 1;
+        let nesting = 1;
+        while (++index < source.length && nesting) {
+          if (source[index] === '[') nesting++;
+          if (source[index] === ']') nesting--;
+        }
         continue;
       }
       const nested = pdfTokens(source, index + 1, true, depth + 1);
@@ -219,28 +216,114 @@ function pdfTokens(
       continue;
     }
     let end = index + 1;
-    while (end < source.length && !/[\s()[\]<>%]/.test(source[end])) end++;
+    while (end < source.length && !/[\s()[\]<>%/]/.test(source[end])) end++;
     tokens.push({ kind: 'word', value: source.slice(index, end) });
     index = end;
   }
   return { tokens, next: index };
 }
 
-function pdfTextOperators(body: string): string[] {
-  const tokens = pdfTokens(body).tokens;
-  const chunks: string[] = [];
-  for (let index = 0; index < tokens.length; index++) {
-    const token = tokens[index];
-    if (token.kind !== 'word') continue;
-    const previous = tokens[index - 1];
-    if (token.value === 'Tj' && previous?.kind === 'text') chunks.push(previous.value);
-    if (token.value === 'TJ' && previous?.kind === 'array')
-      chunks.push(
-        previous.values
-          .filter((value): value is Extract<PdfToken, { kind: 'text' }> => value.kind === 'text')
-          .map((value) => value.value)
-          .join(''),
-      );
+type PdfMatrix = [number, number, number, number, number, number];
+interface PdfTextChunk {
+  text: string;
+  x?: number;
+  y?: number;
+}
+
+function pdfMultiply(left: PdfMatrix, right: PdfMatrix): PdfMatrix {
+  const [a, b, c, d, e, f] = left;
+  const [g, h, i, j, k, l] = right;
+  return [
+    a * g + c * h,
+    b * g + d * h,
+    a * i + c * j,
+    b * i + d * j,
+    a * k + c * l + e,
+    b * k + d * l + f,
+  ];
+}
+
+function pdfNumber(token: PdfToken | undefined): number | undefined {
+  if (token?.kind !== 'word' || !/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(token.value)) return undefined;
+  const value = Number(token.value);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function pdfTextOperators(body: string): PdfTextChunk[] {
+  const chunks: PdfTextChunk[] = [];
+  let operands: PdfToken[] = [];
+  let inText = false;
+  let positioned = false;
+  let matrix: PdfMatrix = [1, 0, 0, 1, 0, 0];
+  let line: PdfMatrix = [...matrix];
+  let transform: PdfMatrix = [...matrix];
+  const saved: PdfMatrix[] = [];
+  let leading = 0;
+  const moveLine = (x: number, y: number) => {
+    line = pdfMultiply(line, [1, 0, 0, 1, x, y]);
+    matrix = [...line];
+    positioned = true;
+  };
+  const show = (text: string) => {
+    if (!inText || !text.trim()) return;
+    const point = pdfMultiply(transform, matrix);
+    chunks.push({
+      text,
+      x: positioned ? point[4] : undefined,
+      y: positioned ? point[5] : undefined,
+    });
+  };
+  for (const token of pdfTokens(body).tokens) {
+    if (token.kind !== 'word' || token.value.startsWith('/') || pdfNumber(token) !== undefined) {
+      operands.push(token);
+      continue;
+    }
+    const numbers = operands.map(pdfNumber);
+    const last = operands.at(-1);
+    if (token.value === 'BT') {
+      inText = true;
+      positioned = false;
+      matrix = [1, 0, 0, 1, 0, 0];
+      line = [...matrix];
+    } else if (token.value === 'ET') inText = false;
+    else if (token.value === 'q') saved.push([...transform]);
+    else if (token.value === 'Q') transform = saved.pop() || transform;
+    else if (token.value === 'cm' && numbers.length === 6 && numbers.every((n) => n !== undefined))
+      transform = pdfMultiply(transform, numbers as PdfMatrix);
+    else if (inText) {
+      if (token.value === 'Tm' && numbers.length === 6 && numbers.every((n) => n !== undefined)) {
+        matrix = numbers as PdfMatrix;
+        line = [...matrix];
+        positioned = true;
+      } else if (
+        (token.value === 'Td' || token.value === 'TD') &&
+        numbers.length === 2 &&
+        numbers.every((n) => n !== undefined)
+      ) {
+        if (token.value === 'TD') leading = -numbers[1]!;
+        moveLine(numbers[0]!, numbers[1]!);
+      } else if (token.value === 'TL' && numbers[0] !== undefined) leading = numbers[0];
+      else if (token.value === 'T*') moveLine(0, -leading);
+      else if (
+        (token.value === 'Tj' || token.value === "'" || token.value === '"') &&
+        last?.kind === 'text'
+      ) {
+        if (token.value !== 'Tj') moveLine(0, -leading);
+        show(last.value);
+      } else if (token.value === 'TJ' && last?.kind === 'array') {
+        let text = '';
+        for (const value of last.values) {
+          if (value.kind === 'text') text += value.value;
+          else {
+            const adjustment = pdfNumber(value);
+            if (adjustment !== undefined && adjustment <= -100 && text && !/\s$/.test(text))
+              text += ' ';
+          }
+        }
+        show(text);
+      }
+    }
+    operands = [];
   }
   return chunks;
 }
@@ -250,80 +333,179 @@ interface PdfObject {
   body: string;
 }
 
-interface PdfStreamDocument {
-  text: string;
-  compressed: boolean;
-}
-
 interface PdfLimits {
   decompressedBytes: number;
+  notes: Set<string>;
 }
 
 interface PdfDocumentText {
   markdown: string;
   pages: string[];
+  note?: string;
 }
 
 interface PdfOutlineEntry {
   title: string;
   level: number;
   pageIndex?: number;
+  top?: number;
+  left?: number;
 }
 
-function pdfDictionary(body: string): string {
-  const stream = /\bstream\r?\n/.exec(body)?.index;
-  return stream === undefined ? body : body.slice(0, stream);
-}
-
-function parsePdfObjects(source: string): Map<number, PdfObject> {
-  const objects = new Map<number, PdfObject>();
-  for (const match of source.matchAll(/(?:^|\r?\n)(\d+)\s+\d+\s+obj\b([\s\S]*?)\bendobj\b/g)) {
-    const id = Number(match[1]);
-    if (Number.isSafeInteger(id)) objects.set(id, { id, body: match[2] });
-  }
-  return objects;
-}
-
-function pdfHasType(body: string, type: string): boolean {
-  return new RegExp(`/Type\\s+/${type}\\b`).test(pdfDictionary(body));
-}
-
-function pdfReference(body: string, key: string): number | undefined {
-  const match = new RegExp(`/${key}\\s+(\\d+)\\s+\\d+\\s+R`).exec(pdfDictionary(body));
-  const id = match ? Number(match[1]) : NaN;
-  return Number.isSafeInteger(id) ? id : undefined;
-}
-
-function pdfReferences(body: string, key: string): number[] {
-  const dictionary = pdfDictionary(body);
-  const array = new RegExp(`/${key}\\s*\\[([\\s\\S]*?)\\]`).exec(dictionary)?.[1];
-  const values = array
-    ? [...array.matchAll(/(\d+)\s+\d+\s+R/g)].map((match) => Number(match[1]))
-    : [];
-  if (values.length) return values.filter((value) => Number.isSafeInteger(value));
-  const single = pdfReference(dictionary, key);
-  return single === undefined ? [] : [single];
-}
-
-function pdfDictionaryText(body: string, key: string): string | undefined {
-  const dictionary = pdfDictionary(body);
-  const tokens = pdfTokens(dictionary).tokens;
-  for (let index = 0; index + 1 < tokens.length; index++) {
-    const token = tokens[index];
-    const value = tokens[index + 1];
-    if (token.kind === 'word' && token.value === `/${key}` && value?.kind === 'text')
-      return stripUnsafeControls(value.value).replace(/\s+/g, ' ').trim();
+function pdfDictionaryEnd(source: string, start = 0): number | undefined {
+  let index = start;
+  while (/\s/.test(source[index] || '') && index < source.length) index++;
+  if (source.slice(index, index + 2) !== '<<') return undefined;
+  let depth = 0;
+  while (index < source.length) {
+    const char = source[index];
+    if (char === '%') {
+      while (index < source.length && !/[\r\n]/.test(source[index])) index++;
+      continue;
+    }
+    if (char === '(') {
+      let literalDepth = 1;
+      while (++index < source.length && literalDepth) {
+        if (source[index] === '\\') index++;
+        else if (source[index] === '(') literalDepth++;
+        else if (source[index] === ')') literalDepth--;
+      }
+      continue;
+    }
+    if (char === '<' && source[index + 1] !== '<') {
+      const end = source.indexOf('>', index + 1);
+      index = end < 0 ? source.length : end + 1;
+      continue;
+    }
+    if (source.slice(index, index + 2) === '<<') {
+      depth++;
+      index += 2;
+    } else if (source.slice(index, index + 2) === '>>') {
+      index += 2;
+      if (--depth === 0) return index;
+    } else index++;
   }
   return undefined;
 }
 
-function pdfDestinationPageReference(body: string): number | undefined {
-  const dictionary = pdfDictionary(body);
-  const destination =
-    /\/Dest\s*(?:\[\s*)?(\d+)\s+\d+\s+R/.exec(dictionary)?.[1] ||
-    /\/D\s*(?:\[\s*)?(\d+)\s+\d+\s+R/.exec(dictionary)?.[1];
-  const id = destination === undefined ? NaN : Number(destination);
-  return Number.isSafeInteger(id) ? id : undefined;
+function pdfDictionary(body: string): string {
+  const end = pdfDictionaryEnd(body);
+  return end === undefined ? body : body.slice(0, end);
+}
+
+function parsePdfObjects(source: string): Map<number, PdfObject> {
+  const objects = new Map<number, PdfObject>();
+  const pattern = /(?:^|[\r\n])(\d+)\s+\d+\s+obj\b/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(source))) {
+    const id = Number(match[1]);
+    const start = pattern.lastIndex;
+    let searchFrom = pdfDictionaryEnd(source, start) ?? start;
+    const stream = /^\s*stream(?:\r\n|\r|\n)/.exec(source.slice(searchFrom));
+    if (stream) {
+      const streamStart = searchFrom + stream[0].length;
+      const length = pdfStreamLength(source.slice(start, searchFrom));
+      searchFrom =
+        length !== undefined && Number.isSafeInteger(length) && length >= 0
+          ? streamStart + length
+          : source.indexOf('endstream', streamStart);
+      if (searchFrom < 0) break;
+    }
+    const end = source.indexOf('endobj', searchFrom);
+    if (end < 0) break;
+    if (Number.isSafeInteger(id)) objects.set(id, { id, body: source.slice(start, end) });
+    pattern.lastIndex = end + 'endobj'.length;
+  }
+  return objects;
+}
+
+function pdfDictionaryValue(body: string, key: string): PdfToken[] {
+  const tokens = pdfTokens(pdfDictionary(body)).tokens;
+  let depth = 0;
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.kind !== 'word') continue;
+    if (token.value === '<<') depth++;
+    else if (token.value === '>>') depth--;
+    else if (depth === 1 && token.value === `/${key}`) return tokens.slice(index + 1);
+  }
+  return [];
+}
+
+function pdfHasType(body: string, type: string): boolean {
+  const value = pdfDictionaryValue(body, 'Type')[0];
+  return value?.kind === 'word' && value.value === `/${type}`;
+}
+
+function pdfTokenReference(tokens: PdfToken[]): number | undefined {
+  const id = pdfNumber(tokens[0]);
+  const generation = pdfNumber(tokens[1]);
+  return id !== undefined &&
+    Number.isSafeInteger(id) &&
+    generation !== undefined &&
+    tokens[2]?.kind === 'word' &&
+    tokens[2].value === 'R'
+    ? id
+    : undefined;
+}
+
+function pdfReference(body: string, key: string): number | undefined {
+  return pdfTokenReference(pdfDictionaryValue(body, key));
+}
+
+function pdfStreamLength(body: string): number | undefined {
+  const values = pdfDictionaryValue(body, 'Length');
+  return pdfTokenReference(values) === undefined ? pdfNumber(values[0]) : undefined;
+}
+
+function pdfReferences(body: string, key: string): number[] {
+  const value = pdfDictionaryValue(body, key);
+  if (value[0]?.kind !== 'array') {
+    const single = pdfTokenReference(value);
+    return single === undefined ? [] : [single];
+  }
+  const references: number[] = [];
+  for (let index = 0; index < value[0].values.length; index++) {
+    const reference = pdfTokenReference(value[0].values.slice(index, index + 3));
+    if (reference !== undefined) references.push(reference);
+  }
+  return references;
+}
+
+function pdfDictionaryText(body: string, key: string): string | undefined {
+  const value = pdfDictionaryValue(body, key)[0];
+  return value?.kind === 'text'
+    ? stripUnsafeControls(value.value).replace(/\s+/g, ' ').trim()
+    : undefined;
+}
+
+function pdfDestination(
+  body: string,
+  objects: Map<number, PdfObject>,
+): { page?: number; top?: number; left?: number } {
+  let values = pdfDictionaryValue(body, 'Dest');
+  if (!values.length) {
+    const action = pdfDictionaryValue(body, 'A');
+    const reference = pdfTokenReference(action);
+    const actionBody =
+      reference === undefined
+        ? pdfDictionary(body).slice(pdfDictionary(body).search(/\/A\b/) + 2)
+        : objects.get(reference)?.body || '';
+    values = pdfDictionaryValue(actionBody, 'D');
+  }
+  const reference = pdfTokenReference(values);
+  if (reference !== undefined) values = pdfTokens(objects.get(reference)?.body || '').tokens;
+  if (values[0]?.kind !== 'array') return {};
+  const destination = values[0].values;
+  const page = pdfTokenReference(destination);
+  const mode = destination[3];
+  const kind = mode?.kind === 'word' ? mode.value : '';
+  if (kind === '/XYZ')
+    return { page, left: pdfNumber(destination[4]), top: pdfNumber(destination[5]) };
+  if (kind === '/FitH' || kind === '/FitBH') return { page, top: pdfNumber(destination[4]) };
+  if (kind === '/FitR')
+    return { page, left: pdfNumber(destination[4]), top: pdfNumber(destination[7]) };
+  return { page };
 }
 
 function decodePdfStream(
@@ -331,7 +513,13 @@ function decodePdfStream(
   compressed: boolean,
   limits: PdfLimits,
 ): string | undefined {
-  if (bytes.length > MAX_PDF_STREAM_BYTES) return undefined;
+  const skipped = () => {
+    limits.notes.add(
+      'Some PDF streams could not be decoded within the extraction limits; text may be missing.',
+    );
+    return undefined;
+  };
+  if (bytes.length > MAX_PDF_STREAM_BYTES) return skipped();
   let decoded = bytes;
   if (compressed) {
     try {
@@ -340,7 +528,7 @@ function decodePdfStream(
       try {
         decoded = inflateRawSync(bytes, { maxOutputLength: MAX_PDF_STREAM_BYTES });
       } catch {
-        return undefined;
+        return skipped();
       }
     }
   }
@@ -348,39 +536,50 @@ function decodePdfStream(
     decoded.length > MAX_PDF_STREAM_BYTES ||
     limits.decompressedBytes + decoded.length > MAX_PDF_DECOMPRESSED_BYTES
   )
-    return undefined;
+    return skipped();
   limits.decompressedBytes += decoded.length;
   return decoded.toString('latin1');
 }
 
-function pdfStreamDocuments(body: string, limits: PdfLimits): PdfStreamDocument[] {
-  const documents: PdfStreamDocument[] = [];
-  const pattern = /([\s\S]*?)\bstream\r?\n([\s\S]*?)\r?\nendstream/g;
-  for (const match of body.matchAll(pattern)) {
-    const bytes = Buffer.from(match[2], 'latin1');
-    const compressed = /\/FlateDecode\b/.test(match[1]);
-    const text = decodePdfStream(bytes, compressed, limits);
-    if (text !== undefined) documents.push({ text, compressed });
+function pdfStreamDocuments(body: string, limits: PdfLimits): string[] {
+  const documents: string[] = [];
+  const dictionaryEnd = pdfDictionaryEnd(body);
+  const pattern = /\bstream(?:\r\n|\r|\n)([\s\S]*?)(?:\r\n|\r|\n)endstream\b/g;
+  if (dictionaryEnd !== undefined) pattern.lastIndex = dictionaryEnd;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(body))) {
+    const dictionary =
+      dictionaryEnd === undefined ? body.slice(0, match.index) : body.slice(0, dictionaryEnd);
+    const filter = pdfDictionaryValue(dictionary, 'Filter')[0];
+    const filters = filter?.kind === 'array' ? filter.values : filter ? [filter] : [];
+    if (
+      filters.some((value) => value.kind !== 'word' || value.value !== '/FlateDecode') ||
+      filters.length > 1
+    ) {
+      limits.notes.add('Some PDF stream filters are unsupported; text may be missing.');
+      continue;
+    }
+    const start = match.index + /^stream(?:\r\n|\r|\n)/.exec(match[0])![0].length;
+    const length = pdfStreamLength(dictionary);
+    const data =
+      length !== undefined && Number.isSafeInteger(length) && length >= 0
+        ? body.slice(start, start + length)
+        : match[1];
+    if (dictionaryEnd !== undefined) pattern.lastIndex = start + data.length;
+    const text = decodePdfStream(Buffer.from(data, 'latin1'), filters.length === 1, limits);
+    if (text !== undefined) documents.push(text);
   }
   return documents;
 }
 
-function pdfTextFromDocuments(documents: Iterable<string>): string {
-  const chunks: string[] = [];
-  for (const document of documents)
-    for (const stream of document.matchAll(/BT([\s\S]*?)ET/g))
-      chunks.push(...pdfTextOperators(stream[1]));
-  return chunks
-    .join('\n')
-    .replace(/[\u0000\r]+/g, '')
-    .replace(/[ \t]+\n/g, '\n')
-    .trim();
-}
-
 function pdfPageReferences(objects: Map<number, PdfObject>): number[] {
+  const catalog = [...objects.values()].find((object) => pdfHasType(object.body, 'Catalog'));
   const roots = [...objects.values()].filter((object) => pdfHasType(object.body, 'Pages'));
+  const catalogRoot = catalog ? pdfReference(catalog.body, 'Pages') : undefined;
   const root =
-    roots.find((object) => pdfReference(object.body, 'Parent') === undefined) || roots[0];
+    catalogRoot === undefined
+      ? roots.find((object) => pdfReference(object.body, 'Parent') === undefined) || roots[0]
+      : objects.get(catalogRoot);
   const pages: number[] = [];
   const seen = new Set<number>();
   const visit = (id: number, depth: number) => {
@@ -405,7 +604,12 @@ function pdfOutlineEntries(
   objects: Map<number, PdfObject>,
   pageIndexes: Map<number, number>,
 ): PdfOutlineEntry[] {
-  const root = [...objects.values()].find((object) => pdfHasType(object.body, 'Outlines'));
+  const catalog = [...objects.values()].find((object) => pdfHasType(object.body, 'Catalog'));
+  const rootId = catalog ? pdfReference(catalog.body, 'Outlines') : undefined;
+  const root =
+    rootId === undefined
+      ? [...objects.values()].find((object) => pdfHasType(object.body, 'Outlines'))
+      : objects.get(rootId);
   const first = root ? pdfReference(root.body, 'First') : undefined;
   if (first === undefined) return [];
   const entries: PdfOutlineEntry[] = [];
@@ -419,15 +623,17 @@ function pdfOutlineEntries(
       if (!object) break;
       const title = pdfDictionaryText(object.body, 'Title');
       if (title) {
-        const pageReference = pdfDestinationPageReference(object.body);
+        const destination = pdfDestination(object.body, objects);
         entries.push({
           title,
           level,
-          pageIndex: pageReference === undefined ? undefined : pageIndexes.get(pageReference),
+          pageIndex: destination.page === undefined ? undefined : pageIndexes.get(destination.page),
+          top: destination.top,
+          left: destination.left,
         });
       }
       const child = pdfReference(object.body, 'First');
-      if (child !== undefined) visit(child, level + 1);
+      if (child !== undefined && level < MAX_PDF_ARRAY_DEPTH) visit(child, level + 1);
       current = pdfReference(object.body, 'Next');
     }
   };
@@ -437,75 +643,110 @@ function pdfOutlineEntries(
 
 function pdfPageText(
   page: PdfObject,
-  objects: Map<number, PdfObject>,
-  streams: Map<number, PdfStreamDocument[]>,
+  streams: Map<number, string[]>,
   limits: PdfLimits,
-): string {
-  const documents: string[] = [];
+): PdfTextChunk[] {
   const contentReferences = pdfReferences(page.body, 'Contents');
-  if (contentReferences.length) {
-    for (const reference of contentReferences) {
-      const content = streams.get(reference);
-      if (content?.length) documents.push(...content.map((item) => item.text));
-      else {
-        const object = objects.get(reference);
-        if (object)
-          documents.push(...pdfStreamDocuments(object.body, limits).map((item) => item.text));
-      }
-    }
-  } else documents.push(...pdfStreamDocuments(page.body, limits).map((item) => item.text));
-  return pdfTextFromDocuments(documents);
+  const documents = contentReferences.length
+    ? contentReferences.flatMap((reference) => streams.get(reference) || [])
+    : pdfStreamDocuments(page.body, limits);
+  return pdfTextOperators(documents.join('\n'));
+}
+
+function pdfText(text: string): string {
+  return redactEmbeddedUrls(stripUnsafeControls(text))
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim()
+    .replace(/^( {0,3})(?=#{1,6}\s|`{3,}|~{3,})/gm, '$1\\');
+}
+
+function pdfOutlinePosition(entry: PdfOutlineEntry, chunks: PdfTextChunk[]): number | undefined {
+  if (entry.top === undefined) return 0;
+  let best: { index: number; distance: number } | undefined;
+  for (const [index, chunk] of chunks.entries()) {
+    if (chunk.y === undefined) continue;
+    const delta = entry.top - chunk.y;
+    const distance =
+      (delta < -2 ? 1_000_000 : 0) +
+      Math.abs(delta) +
+      (entry.left === undefined || chunk.x === undefined
+        ? 0
+        : Math.abs(entry.left - chunk.x) / 10_000);
+    if (!best || distance < best.distance) best = { index, distance };
+  }
+  return best?.index;
 }
 
 function extractPdfDocument(base64: string): PdfDocumentText {
-  let source: string;
-  try {
-    source = Buffer.from(base64, 'base64').toString('latin1');
-  } catch {
-    return { markdown: '', pages: [] };
-  }
+  const source = Buffer.from(base64, 'base64').toString('latin1');
   const objects = parsePdfObjects(source);
-  const limits: PdfLimits = { decompressedBytes: 0 };
-  const streams = new Map<number, PdfStreamDocument[]>();
-  const documents = [source];
-  let compressedStreamFound = false;
-  for (const object of objects.values()) {
-    const decoded = pdfStreamDocuments(object.body, limits);
-    if (!decoded.length) continue;
-    streams.set(object.id, decoded);
-    for (const item of decoded) {
-      if (item.compressed) {
-        compressedStreamFound = true;
-        documents.push(item.text);
-      }
-    }
-  }
-  if (!compressedStreamFound) {
-    for (const item of pdfStreamDocuments(source, limits))
-      if (item.compressed) documents.push(item.text);
-  }
-  const fallback = pdfTextFromDocuments(documents);
+  const limits: PdfLimits = { decompressedBytes: 0, notes: new Set() };
+  const streams = new Map<number, string[]>();
+  for (const object of objects.values())
+    streams.set(object.id, pdfStreamDocuments(object.body, limits));
   const pageReferences = pdfPageReferences(objects);
-  if (!pageReferences.length) return { markdown: fallback, pages: [] };
-  const pageIndexes = new Map(pageReferences.map((id, index) => [id, index]));
-  const pageTexts = pageReferences.map((id) => {
-    const page = objects.get(id);
-    return page ? pdfPageText(page, objects, streams, limits) : '';
-  });
-  if (!pageTexts.some(Boolean)) return { markdown: fallback, pages: [] };
-  const headings = new Map<number, string[]>();
-  for (const entry of pdfOutlineEntries(objects, pageIndexes)) {
-    if (entry.pageIndex === undefined) continue;
-    const prefix = '#'.repeat(Math.min(6, entry.level + 1));
-    const values = headings.get(entry.pageIndex) || [];
-    values.push(`${prefix} ${entry.title}`);
-    headings.set(entry.pageIndex, values);
+  if (!pageReferences.length) {
+    const documents = [...streams.values()].flat();
+    if (!documents.length) documents.push(...pdfStreamDocuments(source, limits));
+    if (!documents.length && !/\bstream(?:\r\n|\r|\n)/.test(source)) documents.push(source);
+    return {
+      markdown: pdfText(
+        pdfTextOperators(documents.join('\n'))
+          .map((chunk) => chunk.text)
+          .join('\n'),
+      ),
+      pages: [],
+      note: [...limits.notes].join('\n') || undefined,
+    };
   }
-  const pages = pageTexts.map((text, index) => {
-    const parts = [...(headings.get(index) || []), text].filter(Boolean);
-    return parts.join('\n\n').trim();
+  const pageIndexes = new Map(pageReferences.map((id, index) => [id, index]));
+  const pageChunks = pageReferences.map((id) => pdfPageText(objects.get(id)!, streams, limits));
+  const outline = pdfOutlineEntries(objects, pageIndexes);
+  const headings = new Map<number, Map<number, string[]>>();
+  let missedOutlines = false;
+  for (const entry of outline) {
+    if (entry.pageIndex === undefined) {
+      missedOutlines = true;
+      continue;
+    }
+    const position = pdfOutlinePosition(entry, pageChunks[entry.pageIndex]);
+    if (position === undefined) {
+      missedOutlines = true;
+      continue;
+    }
+    const page = headings.get(entry.pageIndex) || new Map<number, string[]>();
+    const values = page.get(position) || [];
+    values.push(`${'#'.repeat(Math.min(3, entry.level + 1))} ${pdfText(entry.title)}`);
+    page.set(position, values);
+    headings.set(entry.pageIndex, page);
+  }
+  if (missedOutlines)
+    limits.notes.add(
+      'Some PDF outline destinations could not be matched to extracted text; those headings were omitted.',
+    );
+  const usePageSections = !headings.size;
+  let textlessPages = 0;
+  const pages = pageChunks.map((chunks, index) => {
+    const pageHeadings = headings.get(index);
+    const parts: string[] = usePageSections ? [`# Page ${index + 1}`] : [];
+    for (let position = 0; position <= chunks.length; position++) {
+      parts.push(...(pageHeadings?.get(position) || []));
+      if (position < chunks.length) parts.push(pdfText(chunks[position].text));
+    }
+    if (!chunks.some((chunk) => pdfText(chunk.text))) {
+      textlessPages++;
+      parts.push(
+        'PDF text could not be extracted from this page. Use a screenshot of the visible tab.',
+      );
+    }
+    return parts.filter(Boolean).join('\n\n');
   });
-  return { markdown: pages.filter(Boolean).join('\n\n'), pages };
+  if (textlessPages)
+    limits.notes.add(
+      `No readable text was extracted from ${textlessPages} of ${pages.length} PDF pages; try a screenshot of the visible tab.`,
+    );
+  return { markdown: pages.join('\n\n'), pages, note: [...limits.notes].join('\n') || undefined };
 }
 
 function csvToMarkdown(csv: string): string {
@@ -552,10 +793,12 @@ export function convertSpecialSnapshot(snapshot: PageSnapshot): ConvertedPage {
   if (!special) return convertSnapshot(snapshot);
   let markdown = '';
   let documentPages: string[] | undefined;
+  let extractionNote: string | undefined;
   if (special.kind === 'pdf') {
     const extracted = extractPdfDocument(special.base64 || '');
     markdown = extracted.markdown;
-    documentPages = extracted.pages;
+    documentPages = extracted.pages.map((page) => redactEmbeddedUrls(stripUnsafeControls(page)));
+    extractionNote = extracted.note;
   } else if (special.kind === 'google-sheet') markdown = csvToMarkdown(special.text || '');
   else markdown = (special.text || '').trim();
   markdown = redactEmbeddedUrls(stripUnsafeControls(markdown));
@@ -574,12 +817,11 @@ export function convertSpecialSnapshot(snapshot: PageSnapshot): ConvertedPage {
     pages: documentPages?.length ? documentPages : splitPages(markdown, 20_000),
     pagesAreDocumentPages: special.kind === 'pdf' && Boolean(documentPages?.length),
     note:
-      special.kind === 'pdf' && markdown.startsWith('PDF text could not')
+      extractionNote ||
+      (special.kind === 'pdf' && markdown.startsWith('PDF text could not')
         ? 'try screenshot for this visual document'
-        : undefined,
+        : undefined),
   };
 }
 
-export function plainLinks(markdown: string): string {
-  return markdown.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1');
-}
+export { plainLinks } from './links.js';

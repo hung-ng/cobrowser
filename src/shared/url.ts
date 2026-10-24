@@ -4,11 +4,12 @@ export function redactUrl(value: unknown, maxLength = 2_000): string {
     .replace(/\s+/g, ' ')
     .trim();
   try {
-    const parsed = new URL(text);
+    const relative = text.startsWith('//');
+    const parsed = new URL(relative ? `https:${text}` : text);
     if (parsed.username || parsed.password) {
       parsed.username = '';
       parsed.password = '';
-      text = parsed.toString();
+      text = relative ? parsed.toString().slice('https:'.length) : parsed.toString();
     }
   } catch {
     /* Keep browser URLs with schemes this parser does not understand. */
@@ -17,9 +18,11 @@ export function redactUrl(value: unknown, maxLength = 2_000): string {
 }
 
 const EMBEDDED_URL = /https?:\/\/[^\s<>"']+/gi;
+const AUTHORITY_CREDENTIALS = /(https?:\/\/|(?<!:)\/\/)[^/\s?#<>]*@/gi;
 
 export function redactEmbeddedUrls(value: unknown): string {
-  return String(value ?? '').replace(EMBEDDED_URL, (candidate) =>
-    redactUrl(candidate, Number.MAX_SAFE_INTEGER),
-  );
+  // Quotes can belong to a password, so remove userinfo before locating URL boundaries.
+  return String(value ?? '')
+    .replace(AUTHORITY_CREDENTIALS, '$1')
+    .replace(EMBEDDED_URL, (candidate) => redactUrl(candidate, Number.MAX_SAFE_INTEGER));
 }
