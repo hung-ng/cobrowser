@@ -25,7 +25,7 @@ import {
 import { filterTabs } from '../src/shared/filters.js';
 import { shellCommandArg } from '../src/shared/command.js';
 import { NativeFrameDecoder, encodeFrame } from '../src/shared/native.js';
-import { capResponse, capText, splitPages } from '../src/shared/paging.js';
+import { capResponse, capText, jsonTextSize, splitPages } from '../src/shared/paging.js';
 import { convertSnapshot, convertSpecialSnapshot } from '../src/shared/read.js';
 import {
   buildSectionTree,
@@ -142,11 +142,50 @@ describe('sections', () => {
       ['2', 'Same'],
     ]);
   });
+
+  it('keeps sibling numbers after returning from deeper headings', () => {
+    const markdown = '# Root\n## First\n### Child\none\n## Second\ntwo\n# Next\nthree';
+    const sections = flattenSections(buildSectionTree(markdown));
+    expect(sections.map((section) => section.number)).toEqual(['1', '1.1', '1.1.1', '1.2', '2']);
+    expect(findInMarkdown(markdown, 'two')).toEqual([{ line: 'two', section: '1.2' }]);
+    expect(sections.find((section) => section.number === '1.2')?.text).toBe('## Second\ntwo');
+  });
+
+  it('keeps fenced code in its section and ignores headings inside it', () => {
+    const markdown = [
+      '# Root',
+      '````md',
+      '# example',
+      '```',
+      '## still code',
+      '````',
+      '   ## Child ##',
+      '~~~',
+      '# another example',
+      '~~~',
+      '## Sibling',
+      'answer',
+    ].join('\n');
+    const sections = flattenSections(buildSectionTree(markdown));
+    expect(sections.map(({ number, title }) => [number, title])).toEqual([
+      ['1', 'Root'],
+      ['1.1', 'Child'],
+      ['1.2', 'Sibling'],
+    ]);
+    expect(sections[0].text).toContain('# example');
+    expect(findInMarkdown(markdown, 'example').map((match) => match.section)).toEqual(['1', '1.1']);
+    expect(findInMarkdown(markdown, 'answer')[0]?.section).toBe('1.2');
+  });
 });
 
 describe('paging', () => {
   it('splits at paragraph breaks', () => {
-    expect(splitPages('aaaa\n\nbbbb', 4)).toEqual(['aaaa', 'bbbb']);
+    const source = 'aaaa\n\nbbbb';
+    const pages = splitPages(source, 4);
+    expect(pages[0]).toBe('aaaa');
+    expect(pages.join('')).toBe(source);
+    expect(pages.every((page) => page.length <= 4)).toBe(true);
+    expect(splitPages('aa\n\nbb\n\ncc', 6)).toEqual(['aa\n\n', 'bb\n\ncc']);
   });
 
   it('keeps a long paragraph within the page cap', () => {
@@ -163,6 +202,17 @@ describe('paging', () => {
     expect(result.truncated).toBe(true);
     expect(result.text).toContain('next: cobrowser read 1 --section 2 --page 3');
     expect(result.text.length).toBeLessThanOrEqual(80);
+  });
+
+  it('budgets JSON escapes without splitting Unicode characters', () => {
+    const source = 'a🐈"\\\n\n\t \n漢字'.repeat(20);
+    const pages = splitPages(source, 12, jsonTextSize);
+    expect(pages.join('')).toBe(source);
+    expect(pages.every((page) => jsonTextSize(page) <= 12)).toBe(true);
+    expect(pages.every((page) => !/[\ud800-\udbff]$|^[\udc00-\udfff]/u.test(page))).toBe(true);
+    const capped = capText(source, 24, 'next', 'more', jsonTextSize);
+    expect(jsonTextSize(capped.text)).toBeLessThanOrEqual(24);
+    expect(capped.text).toContain('more: next');
   });
 
   it('caps structured responses after dropping oversized metadata', () => {
@@ -200,7 +250,7 @@ describe('paging', () => {
       { ok: true, text: '\n\nmore: cobrowser tabs --offset 1', data: { tabs: [] } },
       10,
     );
-    expect(protocolOnly).toEqual({ ok: true });
+    expect(protocolOnly).toEqual({});
 
     const error = capResponse(
       { ok: false, error: { code: 'BAD_REQUEST', message: 'x'.repeat(1_000) } },
@@ -262,6 +312,23 @@ describe('denylist', () => {
     expect(matchesDenylist('https://icloud.com/mail%2Finbox', ['icloud.com/mail'])).toBe(true);
     expect(matchesDenylist('https://icloud.com/photos', ['icloud.com/mail'])).toBe(false);
   });
+
+  it('compares encoded paths without changing stored patterns', () => {
+    const patterns = normalizeDenylist(['ARTICLE.TEST/private%20folder', 'article.test/caf%C3%A9']);
+    expect(patterns).toEqual(['article.test/private%20folder', 'article.test/caf%c3%a9']);
+    expect(normalizeDenylist(patterns)).toEqual(patterns);
+    expect(matchesDenylist('https://article.test/private%20folder/note', patterns)).toBe(true);
+    expect(matchesDenylist('https://sub.article.test/private folder/note', patterns)).toBe(true);
+    expect(matchesDenylist('https://article.test/café/note', patterns)).toBe(true);
+    expect(matchesDenylist('https://article.test/private%20folder-extra', patterns)).toBe(false);
+    expect(
+      matchesDenylist('https://article.test/private%2Ffolder/note', [
+        'article.test/private%2ffolder',
+      ]),
+    ).toBe(true);
+    expect(matchesDenylist('https://article.test/private%2520folder/note', patterns)).toBe(false);
+    expect(matchesDenylist('https://article.test/bad%zz/note', ['article.test/bad%zz'])).toBe(true);
+  });
 });
 
 describe('native framing', () => {
@@ -286,6 +353,25 @@ describe('native framing', () => {
 
     expect(decoder.push(frame.subarray(0, 2))).toEqual([]);
     expect(decoder.push(frame.subarray(2))).toEqual([{ id: 3, ok: true }]);
+  });
+
+  it('decodes fragmented large Unicode messages and the following frame', () => {
+    const value = { text: 'text 🐈 漢字'.repeat(100_000) };
+    const bytes = Buffer.concat([encodeFrame(value), encodeFrame({ id: 4 })]);
+    const decoder = new NativeFrameDecoder();
+    const messages: unknown[] = [];
+    for (let offset = 0; offset < bytes.length; offset += 4093)
+      messages.push(...decoder.push(bytes.subarray(offset, offset + 4093)));
+    expect(messages).toEqual([value, { id: 4 }]);
+  });
+
+  it('rejects oversized lengths before buffering a body', () => {
+    const decoder = new NativeFrameDecoder(100);
+    const header = Buffer.alloc(4);
+    header.writeUInt32LE(101);
+    expect(decoder.push(header.subarray(0, 3))).toEqual([]);
+    expect(() => decoder.push(header.subarray(3))).toThrow('exceeds 100 bytes');
+    expect(() => new NativeFrameDecoder().push(Buffer.alloc(4))).toThrow('contain JSON');
   });
 });
 
@@ -426,6 +512,7 @@ describe('client response limits', () => {
     response.end('12345');
 
     await expect(body).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(response.destroyed).toBe(true);
   });
 
   it('rejects a response whose declared size already exceeds the cap', async () => {
@@ -869,5 +956,21 @@ describe('URL redaction', () => {
         'See https://user:pass@example.test/private and https://example.test/public.',
       ),
     ).toBe('See https://example.test/private and https://example.test/public.');
+  });
+
+  it('removes credentials from protocol-relative links and quoted passwords', () => {
+    expect(redactUrl('//user:pass@example.test/private')).toBe('//example.test/private');
+    expect(redactEmbeddedUrls(`<a href="//user:pass@relative.test/private">link</a>`)).toBe(
+      '<a href="//relative.test/private">link</a>',
+    );
+    expect(redactEmbeddedUrls(`https://user:pa'ss@quoted.test/private`)).toBe(
+      'https://quoted.test/private',
+    );
+    expect(redactEmbeddedUrls('https://user:pa"ss@quoted.test/private')).toBe(
+      'https://quoted.test/private',
+    );
+    expect(redactEmbeddedUrls('https://example.test/path?email=alice@example.test')).toBe(
+      'https://example.test/path?email=alice@example.test',
+    );
   });
 });

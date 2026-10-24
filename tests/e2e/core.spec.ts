@@ -192,7 +192,7 @@ async function helperRequest(commandName: string, body: Record<string, unknown>)
 }
 
 function article(title: string, body: string): string {
-  return `<html><head><title>${title}</title></head><body>${body}</body></html>`;
+  return `<html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}</body></html>`;
 }
 
 function longSection(title: string, words: number): string {
@@ -218,7 +218,7 @@ async function launch() {
     launcher,
     `#!/bin/sh
 export COBROWSER_HOME=${home}
-exec ${process.execPath} ${path.join(root, 'dist/helper.js')} --browser chromium
+exec ${process.execPath} ${path.join(root, 'tests/fixtures/native-guard-proxy.mjs')} ${path.join(root, 'dist/helper.js')} ${home}
 `,
   );
   await chmod(launcher, 0o755);
@@ -243,6 +243,11 @@ exec ${process.execPath} ${path.join(root, 'dist/helper.js')} --browser chromium
       `--host-resolver-rules=MAP ${hosts.join(' 127.0.0.1,MAP ')} 127.0.0.1`,
     ],
   });
+  const extensions = await context.newPage();
+  await extensions.goto('chrome://extensions');
+  const developerMode = extensions.locator('#devMode');
+  if (!(await developerMode.evaluate((toggle: any) => toggle.checked))) await developerMode.click();
+  await extensions.close();
 }
 
 test.describe.serial('core loop', () => {
@@ -374,10 +379,27 @@ test.describe.serial('core loop', () => {
         return;
       }
       if (pathname === '/guard-race') {
+        response.end(article('Guard race', '<h1>Guard race</h1><p>Guard race source text.</p>'));
+        return;
+      }
+      if (pathname === '/hierarchy') {
         response.end(
           article(
-            'Guard race',
-            `<script>window.startGuardRace=()=>setTimeout(()=>location.href=${JSON.stringify(url('bank.test', '/account'))},100)</script><h1>Guard race</h1><p>${'race '.repeat(500_000)}</p>`,
+            'Nested headings',
+            '<h1>Root</h1><h2>First</h2><h3>Child</h3><p>Deep text.</p><h2>Second</h2><p>Sibling answer.</p><pre><code># Code example\n## Code child</code></pre><h1>Next</h1><p>Final answer.</p>',
+          ),
+        );
+        return;
+      }
+      if (pathname === '/escaped-pages') {
+        response.end(
+          article(
+            'Escaped pages',
+            Array.from(
+              { length: 24 },
+              (_, index) =>
+                `<p>Row ${String(index).padStart(3, '0')} has "quoted text", backslashes \\path\\file and 🐈 Unicode.</p>`,
+            ).join(''),
           ),
         );
         return;
@@ -406,7 +428,9 @@ test.describe.serial('core loop', () => {
         response.end(
           article(
             'https://user:pass@example.test/title',
-            '<h1>Credential links</h1><p><a href="https://user:pass@example.test/private">private link</a></p>',
+            `<h1>Credential links</h1><p><a href="https://user:pass@example.test/private">private link</a></p>
+            <p><a href="//user:relative-secret@relative.test/private">relative link</a></p>
+            <p><a href="https://user:pa'ss@quoted.test/private">quoted link</a></p>`,
           ),
         );
         return;
@@ -467,7 +491,18 @@ test.describe.serial('core loop', () => {
     expect(read.stdout).toContain('Hello from the fixture');
     const short = await command('--browser', 'chromium', 'read', id!, '--max-chars', '100');
     expect(short.stdout.length).toBeLessThanOrEqual(100);
-    expect(short.stdout).toContain(`next: cobrowser read ${id} --page 1 --max-chars 100`);
+    expect(short.stdout).not.toContain('Hello from the fixture');
+    let retried = short;
+    for (
+      let attempt = 0;
+      attempt < 8 && !retried.stdout.includes('Hello from the fixture');
+      attempt++
+    ) {
+      const next = /(?:next|more): cobrowser (.+)/.exec(retried.stdout)?.[1];
+      expect(next).toBeTruthy();
+      retried = await command(...next!.split(' '));
+    }
+    expect(retried.stdout).toContain('Hello from the fixture');
   });
 
   test('reports the extension as connected after the handshake', async () => {
@@ -480,6 +515,322 @@ test.describe.serial('core loop', () => {
     expect(JSON.parse(capped.stdout)).toEqual(expect.any(Array));
     const tiny = await cli('browsers', '--json', '--max-chars', '1');
     expect(tiny.stdout).toBe('0');
+  });
+
+  test('reconnects after an extension reload without changing browser state', async () => {
+    const before = await invariant();
+    const previous = await worker();
+    const reloaded = context.waitForEvent('serviceworker', {
+      predicate: (item) => item !== previous,
+    });
+    expect(await helperRequest('restart', {})).toMatchObject({ ok: true });
+    const replacement = await reloaded;
+    await expect
+      .poll(
+        () =>
+          replacement.evaluate(async () => (await chrome.storage.local.get('connected')).connected),
+        { timeout: 10_000 },
+      )
+      .toBe(true);
+    await command('--browser', 'chromium', 'tabs');
+    expectInvariantUnchanged(before, await invariant());
+  });
+
+  test('restarts the helper without closing the extension UI when a reload is unnecessary', async () => {
+    const options = await context.newPage();
+    await options.goto(`chrome-extension://${extensionId}/options.html`);
+    try {
+      const before = await invariant();
+      const serviceWorker = await worker();
+      const reconnected = serviceWorker
+        .evaluate(
+          () =>
+            new Promise<string>((resolve) => {
+              let disconnected = false;
+              const listener = (
+                changes: Record<string, chrome.storage.StorageChange>,
+                area: string,
+              ) => {
+                if (area !== 'local' || !changes.connected) return;
+                if (changes.connected.newValue === false) disconnected = true;
+                if (disconnected && changes.connected.newValue === true) {
+                  chrome.storage.onChanged.removeListener(listener);
+                  resolve('connected');
+                }
+              };
+              chrome.storage.onChanged.addListener(listener);
+            }),
+        )
+        .then(
+          (value) => ({ value }),
+          (error) => ({ error: String(error) }),
+        );
+      await serviceWorker.evaluate(() => undefined);
+      expect(await helperRequest('restart', { reloadExtension: false })).toMatchObject({
+        ok: true,
+      });
+      expect(await reconnected).toEqual({ value: 'connected' });
+      expect(context.serviceWorkers()).toContain(serviceWorker);
+      expect(await options.title()).toBe('cobrowser options');
+      expect(await invariant()).toEqual(before);
+      expect(await helperRequest('restart', { reloadExtension: 'false' })).toMatchObject({
+        ok: false,
+        error: { code: 'BAD_REQUEST' },
+      });
+      expect((await cli('--browser', 'chromium', 'tabs')).stdout).toContain('Article title');
+    } finally {
+      await options.close();
+    }
+  });
+
+  test('follows capped tab lists without skipping rows through any interface', async () => {
+    const pages = [];
+    try {
+      for (let index = 0; index < 8; index++) {
+        const page = await context.newPage();
+        pages.push(page);
+        await page.goto(url('article.test', `/capped-tabs-${index}`));
+        await page.evaluate((number) => {
+          document.title = `Capped tab ${number} with "quotes"`;
+        }, index);
+      }
+      const all = JSON.parse(
+        (await command('--browser', 'chromium', 'tabs', '--match', 'capped-tabs-', '--json'))
+          .stdout,
+      ).data.tabs;
+      for (const transport of ['socket', 'json', 'mcp']) {
+        const before = await invariant();
+        const seen: number[] = [];
+        let offset = 0;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const args = { match: 'capped-tabs-', offset, maxChars: 360 };
+          let text: string;
+          if (transport === 'socket') {
+            const result = await helperRequest('tabs', args);
+            expect(JSON.stringify(result).length).toBeLessThanOrEqual(360);
+            text = String(result.text || '');
+          } else if (transport === 'json') {
+            const result = await command(
+              '--browser',
+              'chromium',
+              'tabs',
+              '--match',
+              args.match,
+              '--offset',
+              String(offset),
+              '--max-chars',
+              '360',
+              '--json',
+            );
+            expect(result.stdout.length).toBeLessThanOrEqual(360);
+            text = JSON.parse(result.stdout).text;
+          } else {
+            const [result] = await mcp({
+              jsonrpc: '2.0',
+              id: attempt,
+              method: 'tools/call',
+              params: { name: 'list_tabs', arguments: args },
+            });
+            expect(JSON.stringify(result).length).toBeLessThanOrEqual(360);
+            text = result.result.content[0].text;
+          }
+          const rows = [...text.matchAll(/^(\d+)\s+[*z ]+\s*article\.test/gm)].map((match) =>
+            Number(match[1]),
+          );
+          expect(rows.length).toBeGreaterThan(0);
+          seen.push(...rows);
+          const next = /more: cobrowser tabs .*--offset (\d+)/.exec(text);
+          if (!next) break;
+          expect(Number(next[1])).toBe(offset + rows.length);
+          offset = Number(next[1]);
+        }
+        expect(seen).toEqual(all.map((tab: { id: number }) => tab.id));
+        expectInvariantUnchanged(before, await invariant());
+      }
+    } finally {
+      for (const page of pages) await page.close();
+    }
+  });
+
+  test('uses the same nested sections for outlines, reads and search', async () => {
+    const page = await context.newPage();
+    try {
+      await page.goto(url('article.test', '/hierarchy'));
+      const id = await (
+        await worker()
+      ).evaluate(
+        async (pageUrl) => (await chrome.tabs.query({})).find((tab) => tab.url === pageUrl)!.id!,
+        page.url(),
+      );
+      const before = await invariant();
+      const result = await helperRequest('read', { id, full: true });
+      expect(
+        (result.data as any).sections.map((section: any) => [section.number, section.title]),
+      ).toEqual([
+        ['1', 'Root'],
+        ['1.1', 'First'],
+        ['1.1.1', 'Child'],
+        ['1.2', 'Second'],
+        ['2', 'Next'],
+      ]);
+      const section = await command(
+        '--browser',
+        'chromium',
+        'read',
+        String(id),
+        '--section',
+        '1.2',
+        '--full',
+      );
+      expect(section.stdout).toContain('Sibling answer.');
+      expect(section.stdout).toContain('# Code example');
+      expect(section.stdout).not.toContain('Final answer.');
+      const found = await command('--browser', 'chromium', 'find', String(id), 'Sibling answer');
+      expect(found.stdout).toContain('[1.2]');
+      expectInvariantUnchanged(before, await invariant());
+    } finally {
+      await page.close();
+    }
+  });
+
+  test('preserves every page when switching between MCP, JSON and socket reads', async () => {
+    const page = await context.newPage();
+    try {
+      await page.goto(url('article.test', '/escaped-pages'));
+      const id = await (
+        await worker()
+      ).evaluate(
+        async (pageUrl) => (await chrome.tabs.query({})).find((tab) => tab.url === pageUrl)!.id!,
+        page.url(),
+      );
+      const before = await invariant();
+      const complete = await helperRequest('read', { id, full: true });
+      const bodyOf = (text: string) =>
+        text
+          .split(/\n\n(?:next|more): /)[0]
+          .split('\n\n')
+          .slice(1)
+          .join('\n\n');
+      const bodies: string[] = [];
+      let args: Record<string, any> = { id, full: true, page: 1, maxChars: 700 };
+      for (let index = 0; index < 40; index++) {
+        let text: string;
+        if (index % 3 === 0) {
+          const [result] = await mcp({
+            jsonrpc: '2.0',
+            id: 'long request '.repeat(index + 1).slice(0, 240),
+            method: 'tools/call',
+            params: { name: 'read_tab', arguments: args },
+          });
+          expect(JSON.stringify(result).length).toBeLessThanOrEqual(args.maxChars);
+          text = result.result.content[0].text;
+        } else if (index % 3 === 1) {
+          const result = await command(
+            '--browser',
+            'chromium',
+            'read',
+            String(id),
+            '--full',
+            '--page',
+            String(args.page),
+            '--page-size',
+            String(args.pageSize),
+            '--max-chars',
+            String(args.maxChars),
+            '--json',
+          );
+          expect(result.stdout.length).toBeLessThanOrEqual(args.maxChars);
+          text = JSON.parse(result.stdout).text;
+        } else {
+          const result = await helperRequest('read', args);
+          expect(JSON.stringify(result).length).toBeLessThanOrEqual(args.maxChars);
+          text = String(result.text);
+        }
+        const next = /\n\n(next|more): (.+)$/.exec(text);
+        if (next?.[1] !== 'more') bodies.push(bodyOf(text));
+        if (!next) break;
+        const value = (flag: string) => Number(new RegExp(`${flag} (\\d+)`).exec(next[2])?.[1]);
+        args = {
+          id,
+          full: true,
+          page: value('--page'),
+          pageSize: value('--page-size'),
+          maxChars: value('--max-chars'),
+        };
+        expect(Number.isSafeInteger(args.pageSize)).toBe(true);
+        expect(index).toBeLessThan(39);
+      }
+      expect(bodies.join(' ').replace(/\s+/g, ' ').trim()).toBe(
+        bodyOf(String(complete.text)).replace(/\s+/g, ' ').trim(),
+      );
+      expectInvariantUnchanged(before, await invariant());
+    } finally {
+      await page.close();
+    }
+  });
+
+  test('keeps selected passwords inside the browser', async () => {
+    const page = await context.newPage();
+    try {
+      await page.goto(url('article.test', '/password-selection'));
+      await page.evaluate(() => {
+        const input = document.createElement('input');
+        input.type = 'password';
+        input.value = 'private-selected-password';
+        document.body.append(input);
+        input.focus();
+        input.select();
+      });
+      const id = await (
+        await worker()
+      ).evaluate(
+        async (pageUrl) => (await chrome.tabs.query({})).find((tab) => tab.url === pageUrl)!.id!,
+        page.url(),
+      );
+      const before = await invariant();
+      const result = await helperRequest('selection', { id });
+      expect(result).toMatchObject({ ok: false, error: { code: 'DENIED' } });
+      expect(JSON.stringify(result)).not.toContain('private-selected-password');
+      const [response] = await mcp({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'get_selection', arguments: { id } },
+      });
+      expect(response.result.isError).toBe(true);
+      expectInvariantUnchanged(before, await invariant());
+    } finally {
+      await page.close();
+    }
+  });
+
+  test('records Unicode agent names without invalid HTTP headers', async () => {
+    const before = await invariant();
+    const id = await (
+      await worker()
+    ).evaluate(
+      async () =>
+        (await chrome.tabs.query({})).find((tab) => tab.url?.includes('article.test'))!.id!,
+    );
+    for (const [name, expected] of [
+      ['Trợ lý 🐈 50%', 'Trợ lý 🐈 50%'],
+      [`${'a'.repeat(119)}🐈`, 'a'.repeat(119)],
+      ['agent\ud800', 'agent'],
+    ]) {
+      const responses = await mcp(
+        { jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name } } },
+        {
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/call',
+          params: { name: 'read_tab', arguments: { id } },
+        },
+      );
+      expect(responses[1].result.isError).toBeUndefined();
+      const log = await helperRequest('log', { limit: 1 });
+      expect((log.data as any[])[0].agent).toBe(expected);
+    }
+    expectInvariantUnchanged(before, await invariant());
   });
 
   test('reinstalls setup directories without leaving stale files', async () => {
@@ -847,8 +1198,10 @@ test.describe.serial('core loop', () => {
     );
     expect(sectionPage.stdout).toContain('Long article paragraph');
     expect(sectionPage.stdout.length).toBeLessThanOrEqual(900);
-    expect(sectionPage.stdout).toContain(
-      `next: cobrowser read ${id} --section 0 --page 3 --max-chars 900`,
+    expect(sectionPage.stdout).toMatch(
+      new RegExp(
+        `next: cobrowser read ${id} --section 0 --page 3 --page-size \\d+ --max-chars 900`,
+      ),
     );
     const combined = await command(
       '--browser',
@@ -861,8 +1214,10 @@ test.describe.serial('core loop', () => {
       '--max-chars',
       '900',
     );
-    expect(combined.stdout).toContain(
-      `next: cobrowser read ${id} --section 0 --page 2 --max-chars 900`,
+    expect(combined.stdout).toMatch(
+      new RegExp(
+        `next: cobrowser read ${id}(?: --section 0 --page 2 --page-size \\d+ --max-chars 900| ${secondId} --section 0 --max-chars 1800)`,
+      ),
     );
     const pageOne = await command(
       '--browser',
@@ -1212,6 +1567,8 @@ test.describe.serial('core loop', () => {
       ok: false,
       error: { code: 'BAD_REQUEST', message: 'Use a positive character limit such as 20000.' },
     });
+    const invalidPageSize = await helperRequest('read', { id: Number(plainId), pageSize: 0 });
+    expect(invalidPageSize).toMatchObject({ ok: false, error: { code: 'BAD_REQUEST' } });
     const privatePage = await context.newPage();
     await privatePage.goto(url('bank.test', '/account'));
     const privateTabs = await command('--browser', 'chromium', 'tabs', '--match', 'bank');
@@ -1458,19 +1815,45 @@ test.describe.serial('core loop', () => {
 
   test('rechecks the current tab before delivering a guarded result', async () => {
     const page = await context.newPage();
+    const arm = path.join(home, 'guard-arm');
+    const held = path.join(home, 'guard-held');
+    const release = path.join(home, 'guard-release');
+    let pending: Promise<{ code?: number | string; stdout: string; stderr: string }> | undefined;
     try {
-      await page.goto(url('article.test', '/guard-race'));
+      const source = url('article.test', '/guard-race');
+      const destination = url('bank.test', '/account');
+      await page.goto(source);
       const tabs = await command('--browser', 'chromium', 'tabs', '--match', 'guard-race');
       const id = tabs.stdout.match(/(\d+)\s+[* ]?\s*[z ]?\s+article\.test/)?.[1];
       expect(id).toBeTruthy();
-      await page.evaluate(() => {
-        (window as unknown as { startGuardRace?: () => void }).startGuardRace?.();
-      });
-      const error = await cli('--browser', 'chromium', 'read', id!).catch((value) => value);
+      await writeFile(arm, JSON.stringify({ tabId: Number(id) }));
+      const before = await invariant();
+      pending = cli('--browser', 'chromium', 'read', id!).catch((value) => value);
+      await expect.poll(() => readFile(held, 'utf8').catch(() => '')).toBe('held');
+      expectInvariantUnchanged(before, await invariant());
+      await page.goto(destination);
+      const navigated = await invariant();
+      expectInvariantUnchanged(
+        {
+          ...before,
+          tabUrls: before.tabUrls.map(
+            ([tabId, href]) => [tabId, tabId === Number(id) ? destination : href] as const,
+          ),
+          pages: before.pages.filter((entry) => entry.url !== source),
+        },
+        navigated,
+      );
+      await writeFile(release, 'release');
+      const error = await pending;
+      expect(error.code).toEqual(expect.any(Number));
       expect(error.code).not.toBe(0);
       expect(error.stderr).toMatch(/TIMEOUT|DENIED/);
-      await expect.poll(() => page.url()).toContain('bank.test');
+      expect(error.stdout).toBe('');
+      expectInvariantUnchanged(navigated, await invariant());
     } finally {
+      await writeFile(release, 'release');
+      await pending;
+      await Promise.all([arm, held, release].map((file) => rm(file, { force: true })));
       await page.close();
     }
   });
@@ -1605,7 +1988,18 @@ test.describe.serial('core loop', () => {
       '--max-chars',
       '180',
     );
-    expect(multiCapped.stdout).toContain(`next: cobrowser read ${id} --links --max-chars 180`);
+    const pending = [multiCapped.stdout];
+    let reconstructed = '';
+    for (let attempt = 0; pending.length && attempt < 32; attempt++) {
+      const output = pending.shift()!;
+      reconstructed += output.replace(/(?:next|more|also): cobrowser [^\n]+/g, '');
+      for (const match of output.matchAll(/(?:next|more|also): cobrowser ([^\n]+)/g)) {
+        expect(match[1]).toContain('--links');
+        pending.push((await command(...match[1].split(' '))).stdout);
+      }
+    }
+    expect(pending).toHaveLength(0);
+    expect(reconstructed.match(/Hello from the fixture/g)).toHaveLength(2);
     const screenshot = await command(
       '--browser',
       'chromium',
@@ -1684,9 +2078,17 @@ test.describe.serial('core loop', () => {
     const read = await command('--browser', 'chromium', 'read', id!, '--links');
     expect(read.stdout).toContain('https://example.test/private');
     expect(read.stdout).not.toContain('user:pass');
+    expect(read.stdout).toContain('//relative.test/private');
+    expect(read.stdout).toContain('https://quoted.test/private');
+    expect(read.stdout).not.toContain('relative-secret');
+    expect(read.stdout).not.toContain("pa'ss");
     const queried = await command('--browser', 'chromium', 'query', id!, 'a', '--html');
     expect(queried.stdout).toContain('https://example.test/private');
     expect(queried.stdout).not.toContain('user:pass');
+    expect(queried.stdout).toContain('//relative.test/private');
+    expect(queried.stdout).toContain('https://quoted.test/private');
+    expect(queried.stdout).not.toContain('relative-secret');
+    expect(queried.stdout).not.toContain("pa'ss");
   });
 
   test('guards a tab with credentials and a long URL without redacting its identity', async () => {
@@ -1867,39 +2269,41 @@ test.describe.serial('core loop', () => {
   });
 
   test('serves MCP initialization, tools and tab reads over stdio', async () => {
-    const responses = await mcp(
-      {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'initialize',
-        params: { clientInfo: { name: 'playwright' } },
-      },
-      { jsonrpc: '2.0', id: 2, method: 'tools/list' },
-      {
-        jsonrpc: '2.0',
-        id: 3,
-        method: 'tools/call',
-        params: { name: 'list_tabs', arguments: { match: 'article' } },
-      },
-      {
-        jsonrpc: '2.0',
-        id: 4,
-        method: 'tools/call',
-        params: { name: 'screenshot', arguments: { maxChars: 100_000 } },
-      },
-      {
-        jsonrpc: '2.0',
-        id: 5,
-        method: 'tools/call',
-        params: { name: 'list_tabs', arguments: { match: 'article', maxChars: 100 } },
-      },
-      {
-        jsonrpc: '2.0',
-        id: 6,
-        method: 'tools/call',
-        params: { name: 'screenshot', arguments: { maxChars: 1_000 } },
-      },
-    );
+    const responses = (
+      await mcp(
+        {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: { clientInfo: { name: 'playwright' } },
+        },
+        { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+        {
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'tools/call',
+          params: { name: 'list_tabs', arguments: { match: 'article' } },
+        },
+        {
+          jsonrpc: '2.0',
+          id: 4,
+          method: 'tools/call',
+          params: { name: 'screenshot', arguments: { maxChars: 100_000 } },
+        },
+        {
+          jsonrpc: '2.0',
+          id: 5,
+          method: 'tools/call',
+          params: { name: 'list_tabs', arguments: { match: 'article', maxChars: 100 } },
+        },
+        {
+          jsonrpc: '2.0',
+          id: 6,
+          method: 'tools/call',
+          params: { name: 'screenshot', arguments: { maxChars: 1_000 } },
+        },
+      )
+    ).sort((left, right) => left.id - right.id);
     expect(responses[0]).toMatchObject({
       id: 1,
       result: { serverInfo: { name: 'cobrowser' }, capabilities: { tools: {} } },

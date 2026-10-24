@@ -9,30 +9,24 @@ import {
   normalizeErrorCode,
   VERSION,
 } from './shared/constants.js';
-import { capText } from './shared/paging.js';
+import { capContinuationText, capText } from './shared/paging.js';
 import { parseDuration as parseDurationValue } from './shared/duration.js';
 import { redactEmbeddedUrls } from './shared/url.js';
 import { runMcp } from './mcp.js';
 import { isSectionNumber } from './shared/sections.js';
-import {
-  detectBrowsers,
-  doctor,
-  isSimpleBrowserName,
-  setup,
-  SUPPORTED_BROWSERS,
-  type SupportedBrowser,
-} from './setup.js';
+import { detectBrowsers, doctor, isSimpleBrowserName, setup, SUPPORTED_BROWSERS } from './setup.js';
 
 let jsonRequested = false;
 let jsonMaxChars = MAX_CHARS;
 
 function takeFlag(args: string[], name: string): string | undefined {
-  const i = args.indexOf(name);
+  const i = args.findIndex((arg) => arg === name || arg.startsWith(`${name}=`));
   if (i < 0) return undefined;
-  const value = args[i + 1];
-  if (!value || value.startsWith('--'))
+  const separate = args[i] === name;
+  const value = separate ? args[i + 1] : args[i].slice(name.length + 1);
+  if (!value || (separate && value.startsWith('--')))
     throw Object.assign(new Error(`Use ${name} with a value.`), { code: 'BAD_REQUEST' });
-  args.splice(i, 2);
+  args.splice(i, separate ? 2 : 1);
   return value;
 }
 
@@ -55,6 +49,8 @@ function minimalJson(maxChars: number, array = false, ok?: boolean): string {
 function jsonOutput(result: any, maxChars: number): string {
   const full = JSON.stringify(result, null, 2);
   if (full.length <= maxChars) return full;
+  const compactFull = JSON.stringify(result);
+  if (compactFull.length <= maxChars) return compactFull;
   if (result?.data !== undefined) {
     const withoutData = { ...result };
     delete withoutData.data;
@@ -151,7 +147,7 @@ function print(result: any, json: boolean, maxChars = MAX_CHARS) {
     process.stdout.write(output.length < maxChars ? `${output}\n` : output);
     if (!result.ok) process.exitCode = 1;
   } else if (result.ok) {
-    const output = safeTerminalText(result.text || '');
+    const output = capContinuationText(safeTerminalText(result.text || ''), maxChars);
     process.stdout.write(output.length < maxChars ? `${output}\n` : output);
   } else
     throw Object.assign(new Error(result.error?.message || 'The request failed. Try again.'), {
@@ -162,7 +158,7 @@ function print(result: any, json: boolean, maxChars = MAX_CHARS) {
 const USAGE = `cobrowser tabs [options]
 cobrowser read <id...> [options]
 cobrowser find <id> "text"
-cobrowser query <id> "selector" [--html]
+cobrowser query <id> "selector" [--html] [--limit N] [--offset N]
 cobrowser selection [id]
 cobrowser screenshot [--out path]
 cobrowser log [--limit N]
@@ -172,20 +168,25 @@ cobrowser doctor
 cobrowser mcp
 
 Global options: --browser name, --json, --max-chars N, --help, --version
+Use -- before positional arguments that start with --.
 `;
 
 async function main() {
   const args = process.argv.slice(2);
+  const optionEnd = args.indexOf('--');
+  const literal = optionEnd < 0 ? [] : args.splice(optionEnd).slice(1);
   const json = hasFlag(args, '--json');
   jsonRequested = json;
   const help = hasFlag(args, '--help');
   const version = hasFlag(args, '--version');
-  const browser = takeFlag(args, '--browser');
   const maxChars = takeFlag(args, '--max-chars');
   const maxCharsValue = maxChars === undefined ? undefined : parseMaxChars(maxChars);
   const outputMaxChars = maxCharsValue ?? MAX_CHARS;
   jsonMaxChars = maxCharsValue ?? MAX_CHARS;
-  const command = args.shift();
+  const browser = takeFlag(args, '--browser');
+  const command = args.shift() ?? literal.shift();
+  if (literal.length && !['read', 'find', 'query', 'selection'].includes(command || ''))
+    throw Object.assign(new Error(`Unknown argument: ${literal[0]}.`), { code: 'BAD_REQUEST' });
   if (help) {
     writeBoundedText(USAGE, outputMaxChars);
     return;
@@ -295,7 +296,7 @@ async function main() {
     if (limit !== undefined) body.limit = parseIntegerFlag(limit, '--limit');
     const offset = takeFlag(args, '--offset');
     if (offset !== undefined) body.offset = parseIntegerFlag(offset, '--offset', 0);
-    if (maxCharsValue !== undefined) body.maxChars = maxCharsValue;
+    if (maxCharsValue !== undefined) body.maxChars = Math.max(64, maxCharsValue);
     ensureNoArgs(args);
     print(
       await new CobrowserClient({ browser }).request('tabs', body),
@@ -307,6 +308,7 @@ async function main() {
   if (command === 'read') {
     const ids: number[] = [];
     while (args.length && !args[0].startsWith('-')) ids.push(Number(args.shift()));
+    ids.push(...literal.map(Number));
     if (!ids.length || ids.some((id) => !Number.isSafeInteger(id)))
       throw Object.assign(new Error('Usage: cobrowser read <id>.'), { code: 'BAD_REQUEST' });
     const body: Record<string, unknown> = ids.length === 1 ? { id: ids[0] } : { ids };
@@ -320,9 +322,11 @@ async function main() {
     }
     const page = takeFlag(args, '--page');
     if (page) body.page = parseIntegerFlag(page, '--page');
+    const pageSize = takeFlag(args, '--page-size');
+    if (pageSize !== undefined) body.pageSize = parseIntegerFlag(pageSize, '--page-size');
     if (hasFlag(args, '--full')) body.full = true;
     if (hasFlag(args, '--links')) body.links = true;
-    if (maxCharsValue !== undefined) body.maxChars = maxCharsValue;
+    if (maxCharsValue !== undefined) body.maxChars = Math.max(64, maxCharsValue);
     ensureNoArgs(args);
     print(
       await new CobrowserClient({ browser }).request('read', body),
@@ -332,15 +336,15 @@ async function main() {
     return;
   }
   if (command === 'find') {
-    const id = Number(args.shift());
+    const id = Number(args.shift() ?? literal.shift());
     const unknown = args.find((value) => value.startsWith('--'));
     if (unknown)
       throw Object.assign(new Error(`Unknown argument: ${unknown}.`), { code: 'BAD_REQUEST' });
-    const query = args.join(' ').trim();
+    const query = [...args, ...literal].join(' ').trim();
     if (!Number.isSafeInteger(id) || !query)
       throw Object.assign(new Error('Usage: cobrowser find <id> "text".'), { code: 'BAD_REQUEST' });
     const body: Record<string, unknown> = { id, query };
-    if (maxCharsValue !== undefined) body.maxChars = maxCharsValue;
+    if (maxCharsValue !== undefined) body.maxChars = Math.max(64, maxCharsValue);
     print(
       await new CobrowserClient({ browser }).request('find', body),
       json,
@@ -349,18 +353,21 @@ async function main() {
     return;
   }
   if (command === 'query') {
-    const id = Number(args.shift());
-    const selector = args.shift();
+    const html = hasFlag(args, '--html');
+    const offset = takeFlag(args, '--offset');
+    const limit = takeFlag(args, '--limit');
+    const id = Number(args.shift() ?? literal.shift());
+    const selector = args.shift() ?? literal.shift();
     if (!Number.isSafeInteger(id) || !selector)
       throw Object.assign(new Error('Usage: cobrowser query <id> "css selector".'), {
         code: 'BAD_REQUEST',
       });
     const body: Record<string, unknown> = { id, selector };
-    if (hasFlag(args, '--html')) body.html = true;
-    const limit = takeFlag(args, '--limit');
+    if (html) body.html = true;
+    if (offset !== undefined) body.offset = parseIntegerFlag(offset, '--offset', 0);
     if (limit !== undefined) body.limit = parseIntegerFlag(limit, '--limit');
-    if (maxCharsValue !== undefined) body.maxChars = maxCharsValue;
-    ensureNoArgs(args);
+    if (maxCharsValue !== undefined) body.maxChars = Math.max(64, maxCharsValue);
+    ensureNoArgs([...args, ...literal]);
     print(
       await new CobrowserClient({ browser }).request('query', body),
       json,
@@ -369,7 +376,11 @@ async function main() {
     return;
   }
   if (command === 'selection') {
-    const idText = args[0]?.startsWith('-') ? undefined : args.shift();
+    const idText = args.length
+      ? args[0].startsWith('-')
+        ? undefined
+        : args.shift()
+      : literal.shift();
     const body: Record<string, unknown> = {};
     if (idText !== undefined) {
       const id = Number(idText);
@@ -377,8 +388,8 @@ async function main() {
         throw Object.assign(new Error('Usage: cobrowser selection [id].'), { code: 'BAD_REQUEST' });
       body.id = id;
     }
-    if (maxCharsValue !== undefined) body.maxChars = maxCharsValue;
-    ensureNoArgs(args);
+    if (maxCharsValue !== undefined) body.maxChars = Math.max(64, maxCharsValue);
+    ensureNoArgs([...args, ...literal]);
     print(
       await new CobrowserClient({ browser }).request('selection', body),
       json,
@@ -436,7 +447,7 @@ async function main() {
     const limit = takeFlag(args, '--limit');
     const body: Record<string, unknown> = {};
     if (limit !== undefined) body.limit = parseIntegerFlag(limit, '--limit');
-    if (maxCharsValue !== undefined) body.maxChars = maxCharsValue;
+    if (maxCharsValue !== undefined) body.maxChars = Math.max(64, maxCharsValue);
     ensureNoArgs(args);
     print(
       await new CobrowserClient({ browser }).request('log', body),

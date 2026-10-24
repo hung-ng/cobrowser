@@ -10,6 +10,15 @@ import {
 import { googleExportUrl, specialKind } from '../shared/special.js';
 import { normalizeOpenTimes, type OpenTimes } from '../shared/open-times.js';
 import { redactEmbeddedUrls } from '../shared/url.js';
+import {
+  DocumentFetchTracker,
+  documentFetchError,
+  type DocumentFetchAttempt,
+} from './document-fetch-tracker.js';
+import { documentPageFetch, type DocumentPageResult } from './document-page-fetch.js';
+import { registerOptionsSettings } from './options-settings.js';
+
+registerOptionsSettings();
 
 interface RequestMessage {
   id: number;
@@ -31,6 +40,85 @@ let handshakePending = false;
 let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
 let recentReadsQueue: Promise<void> = Promise.resolve();
 let connectionStateQueue: Promise<void> = Promise.resolve();
+const pauseSession = crypto.randomUUID();
+let pauseGeneration = 0;
+let policyGeneration = 0;
+let documentGeneration = 0;
+const documentVersions = new Map<number, number>();
+const activationVersions = new Map<number, number>();
+const documentFetches = new DocumentFetchTracker();
+
+interface GuardAccess {
+  policyEpoch: string;
+  tabs: Array<{ id: number; documentEpoch: string }>;
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.paused?.newValue === true) pauseGeneration++;
+  if (area === 'local' && changes.denylist) policyGeneration++;
+  if (area === 'local' && changes.paused?.newValue === true) documentFetches.cancel('PAUSED');
+  if (area === 'local' && changes.denylist) documentFetches.cancel('DENIED');
+});
+
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (change.url || change.status === 'loading') documentVersions.set(tabId, ++documentGeneration);
+  if (change.url || change.status === 'loading') documentFetches.cancel('TIMEOUT', tabId);
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  documentVersions.delete(tabId);
+  documentFetches.cancel('TIMEOUT', tabId);
+});
+chrome.tabs.onReplaced.addListener((added, removed) => {
+  documentVersions.delete(removed);
+  documentVersions.set(added, ++documentGeneration);
+  documentFetches.cancel('TIMEOUT', removed);
+});
+chrome.tabs.onActivated.addListener(({ windowId }) => {
+  activationVersions.set(windowId, (activationVersions.get(windowId) ?? 0) + 1);
+});
+chrome.windows.onRemoved.addListener((windowId) => activationVersions.delete(windowId));
+
+function documentEpoch(tabId: number): string {
+  if (!documentVersions.has(tabId)) documentVersions.set(tabId, ++documentGeneration);
+  return `${pauseSession}:${documentVersions.get(tabId)}`;
+}
+
+function assertDocumentEpoch(tabId: number, expected: string) {
+  if (expected !== `${pauseSession}:${documentVersions.get(tabId)}`)
+    throw Object.assign(
+      new Error('The document changed while delivering the result; retry the command.'),
+      { code: 'TIMEOUT' },
+    );
+}
+
+function policyEpoch(): string {
+  return `${pauseSession}:${policyGeneration}`;
+}
+
+function assertPolicyEpoch(expected: string) {
+  if (expected !== policyEpoch())
+    throw Object.assign(
+      new Error('The denylist changed while delivering the result; retry the command.'),
+      { code: 'DENIED' },
+    );
+}
+
+function assertGuardAccess(access: GuardAccess) {
+  assertPolicyEpoch(access.policyEpoch);
+  for (const tab of access.tabs) assertDocumentEpoch(tab.id, tab.documentEpoch);
+}
+
+function pauseEpoch(): string {
+  return `${pauseSession}:${pauseGeneration}`;
+}
+
+async function assertNotPaused(expected: string) {
+  const isPaused = await paused();
+  if (isPaused || expected !== pauseEpoch())
+    throw Object.assign(new Error('cobrowser was paused; turn it on and retry the command.'), {
+      code: 'PAUSED',
+    });
+}
 
 const storageSession = () => (chrome.storage as any).session as chrome.storage.StorageArea;
 function cleanErrorMessage(value: unknown, fallback: string): string {
@@ -310,6 +398,7 @@ async function connect() {
         return;
       }
       if (event === 'reload_extension') {
+        documentFetches.cancel('EXTENSION_DISCONNECTED');
         chrome.runtime.reload();
         return;
       }
@@ -335,6 +424,7 @@ async function connect() {
     }, 5_000);
     port.onDisconnect.addListener(() => {
       if (nativePort !== port) return;
+      documentFetches.cancel('EXTENSION_DISCONNECTED');
       if (handshakeTimer) {
         clearTimeout(handshakeTimer);
         handshakeTimer = undefined;
@@ -381,8 +471,10 @@ async function tabUrlHash(value: unknown): Promise<string> {
 }
 
 async function assertResultAllowed(result: unknown) {
+  const expectedPolicy = policyEpoch();
   const patterns = await denyPatterns();
   const seen = new Set<object>();
+  const documents: Array<{ id: number; documentEpoch: string }> = [];
   const visit = (value: unknown) => {
     if (!value || typeof value !== 'object' || seen.has(value)) return;
     seen.add(value);
@@ -393,14 +485,52 @@ async function assertResultAllowed(result: unknown) {
     const record = value as { incognito?: unknown; url?: unknown } & Record<string, unknown>;
     if (typeof record.url === 'string')
       assertTabAllowed({ incognito: record.incognito === true, url: record.url }, patterns);
+    if (typeof record.documentEpoch === 'string') {
+      const id = typeof record.tabId === 'number' ? record.tabId : record.id;
+      if (typeof id === 'number') documents.push({ id, documentEpoch: record.documentEpoch });
+    }
+    if (Array.isArray(record.sourceUrls))
+      for (const url of record.sourceUrls)
+        if (typeof url === 'string') assertTabAllowed({ url }, patterns);
     for (const entry of Object.values(record)) visit(entry);
   };
   visit(result);
+  return () => {
+    assertPolicyEpoch(expectedPolicy);
+    for (const document of documents) assertDocumentEpoch(document.id, document.documentEpoch);
+  };
 }
 
 async function assertGuardAllowed(params: Record<string, unknown> | undefined) {
   const urls = params?.urls;
   const tabs = params?.tabs;
+  const prior = params?.access as GuardAccess | undefined;
+  if (
+    prior !== undefined &&
+    (!prior ||
+      typeof prior !== 'object' ||
+      typeof prior.policyEpoch !== 'string' ||
+      prior.policyEpoch.length > 100 ||
+      !Array.isArray(prior.tabs) ||
+      prior.tabs.length > 200 ||
+      prior.tabs.some(
+        (tab) =>
+          !tab ||
+          !Number.isSafeInteger(tab.id) ||
+          tab.id < 0 ||
+          typeof tab.documentEpoch !== 'string' ||
+          tab.documentEpoch.length > 100,
+      ))
+  )
+    throw Object.assign(
+      new Error('The helper sent invalid guard access metadata; retry the command.'),
+      { code: 'BAD_REQUEST' },
+    );
+  const access: GuardAccess = {
+    policyEpoch: prior?.policyEpoch ?? policyEpoch(),
+    tabs: prior?.tabs.slice() ?? [],
+  };
+  assertGuardAccess(access);
   if (
     urls !== undefined &&
     (!Array.isArray(urls) ||
@@ -421,6 +551,8 @@ async function assertGuardAllowed(params: Record<string, unknown> | undefined) {
           ((value as { id: number }).id as number) < 0 ||
           typeof (value as { url?: unknown }).url !== 'string' ||
           (value as { url: string }).url.length > MAX_GUARD_URL_CHARS ||
+          typeof (value as { documentEpoch?: unknown }).documentEpoch !== 'string' ||
+          (value as { documentEpoch: string }).documentEpoch.length > 100 ||
           ((value as { urlHash?: unknown }).urlHash !== undefined &&
             (typeof (value as { urlHash?: unknown }).urlHash !== 'string' ||
               !/^[0-9a-f]{64}$/i.test((value as { urlHash: string }).urlHash))),
@@ -431,9 +563,10 @@ async function assertGuardAllowed(params: Record<string, unknown> | undefined) {
   if (Array.isArray(urls)) for (const url of urls) assertTabAllowed({ url }, patterns);
   if (Array.isArray(tabs))
     for (const value of tabs) {
-      const expected = value as { id: number; url: string };
+      const expected = value as { id: number; url: string; documentEpoch: string };
       const tab = await getTab(expected.id);
       assertTabAllowed(tab, patterns);
+      assertDocumentEpoch(expected.id, expected.documentEpoch);
       const expectedHash = (value as { urlHash?: string }).urlHash;
       const matches = expectedHash
         ? (await tabUrlHash(tab.url)) === expectedHash.toLowerCase()
@@ -442,7 +575,20 @@ async function assertGuardAllowed(params: Record<string, unknown> | undefined) {
         throw Object.assign(new Error('The tab changed while delivering the result.'), {
           code: 'TIMEOUT',
         });
+      const previous = access.tabs.find((tab) => tab.id === expected.id);
+      if (previous && previous.documentEpoch !== expected.documentEpoch)
+        throw Object.assign(
+          new Error('The document changed while delivering the result; retry the command.'),
+          { code: 'TIMEOUT' },
+        );
+      if (!previous) access.tabs.push({ id: expected.id, documentEpoch: expected.documentEpoch });
     }
+  if (access.tabs.length > 200)
+    throw Object.assign(new Error('The helper sent too many guard tabs; retry the command.'), {
+      code: 'BAD_REQUEST',
+    });
+  assertGuardAccess(access);
+  return access;
 }
 
 async function verifyReadTab(tabId: number, expectedUrl: string): Promise<chrome.tabs.Tab> {
@@ -461,6 +607,7 @@ async function tabList() {
     chrome.tabs.query({}),
     chrome.windows.getLastFocused({ windowTypes: ['normal'] }),
   ]);
+  const epochs = new Map(tabs.map((tab) => [tab.id!, documentEpoch(tab.id!)]));
   const patterns = await denyPatterns();
   let hidden = 0;
   const visible = tabs
@@ -484,6 +631,7 @@ async function tabList() {
       status: tab.status,
       incognito: Boolean(tab.incognito),
       denied: matchesDenylist(tab.url || '', patterns),
+      documentEpoch: epochs.get(tab.id!),
     }));
   return { tabs: visible, hidden, frontWindowId: lastFocused.id };
 }
@@ -491,6 +639,7 @@ async function tabList() {
 async function tabInfo(tabId: number) {
   await openTimesReady;
   const tab = await getTab(tabId);
+  const expectedDocument = documentEpoch(tabId);
   const patterns = await denyPatterns();
   assertTabAllowed(tab, patterns);
   return {
@@ -505,6 +654,7 @@ async function tabInfo(tabId: number) {
     status: tab.status,
     incognito: Boolean(tab.incognito),
     denied: false,
+    documentEpoch: expectedDocument,
   };
 }
 
@@ -604,17 +754,6 @@ function responseBytesTooLarge(response: Response, limit: number): boolean {
   return Number.isFinite(contentLength) && contentLength > limit;
 }
 
-async function fetchWithTimeout(
-  requestUrl: string,
-  init: RequestInit,
-  timeoutMs: number,
-): Promise<Response> {
-  return fetch(requestUrl, {
-    ...init,
-    signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
-  });
-}
-
 async function readResponseBytes(
   response: Response,
   limit: number,
@@ -659,194 +798,303 @@ async function readResponseBytes(
   return { bytes, tooLarge: false };
 }
 
+interface SpecialFetchChecks {
+  deadline: number;
+  tabId: number;
+  tabUrl: string;
+  check: () => void;
+  allowed: (url: string) => void;
+  finish: (
+    attempt: DocumentFetchAttempt,
+    url?: string,
+    mode?: 'body' | 'network' | 'diagnostic',
+  ) => Promise<string[]>;
+}
+
+type SpecialPageResult = DocumentPageResult & { sourceUrls: string[] };
+
+async function fetchWithinDeadline<T>(value: Promise<T>, deadline: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      value,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(documentFetchError()), Math.max(1, deadline - Date.now()));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function fetchSpecial(
   tabId: number,
   url: string,
   kind: 'pdf' | 'google-doc' | 'google-sheet' | 'google-slide',
 ) {
+  const deadline = Date.now() + SPECIAL_FETCH_TIMEOUT_MS;
+  const expectedDocument = documentEpoch(tabId);
+  const expectedPause = pauseEpoch();
+  const expectedPolicy = policyEpoch();
+  await fetchWithinDeadline(assertNotPaused(expectedPause), deadline);
+  const patterns = await fetchWithinDeadline(denyPatterns(), deadline);
+  const check = () => {
+    assertPolicyEpoch(expectedPolicy);
+    assertDocumentEpoch(tabId, expectedDocument);
+    if (pauseEpoch() !== expectedPause) throw documentFetchError('PAUSED');
+    if (!nativePort || handshakePending) throw documentFetchError('EXTENSION_DISCONNECTED');
+  };
+  const checks: SpecialFetchChecks = {
+    deadline,
+    tabId,
+    tabUrl: url,
+    check,
+    allowed: (value) => assertTabAllowed({ url: value }, patterns),
+    finish: (attempt, resultUrl, mode = 'body') =>
+      attempt.race(
+        (async () => {
+          const urls = await attempt.finish(resultUrl, mode);
+          await assertNotPaused(expectedPause);
+          await verifyReadTab(tabId, url);
+          attempt.check();
+          return urls;
+        })(),
+      ),
+  };
+  check();
   const exportInfo = googleExportUrl(url);
   const target = kind === 'pdf' ? url : exportInfo?.url;
   if (!target)
     throw Object.assign(new Error('This Google file URL is not an exportable document.'), {
       code: 'UNREADABLE',
     });
+  const file = new URL(target).protocol === 'file:';
+  if (file && !(await fetchWithinDeadline(chrome.extension.isAllowedFileSchemeAccess(), deadline)))
+    throw Object.assign(
+      new Error('Local files are unavailable; turn on file URL access for cobrowser and retry.'),
+      { code: 'UNREADABLE' },
+    );
   const targets =
     kind === 'google-doc' ? [target, target.replace('format=md', 'format=txt')] : [target];
   let lastStatus = 0;
-  let emptyGoogleDoc: { kind: 'google-doc'; text: string } | undefined;
-  const deadline = Date.now() + SPECIAL_FETCH_TIMEOUT_MS;
+  let emptyGoogleDoc: { kind: 'google-doc'; text: string; sourceUrls: string[] } | undefined;
   for (const requestUrl of targets) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-    const pageResult = await fetchSpecialInPage(tabId, requestUrl, kind, remaining);
-    if (pageResult?.url) assertTabAllowed({ url: pageResult.url }, await denyPatterns());
+    check();
+    if (Date.now() >= deadline) throw documentFetchError();
+    checks.allowed(requestUrl);
+    const pageResult = await fetchSpecialInPage(tabId, requestUrl, kind, checks);
     if (pageResult?.ok) {
-      if (kind === 'pdf') return { kind, base64: pageResult.base64 || '' };
+      if (kind === 'pdf')
+        return { kind, base64: pageResult.base64 || '', sourceUrls: pageResult.sourceUrls };
       const text = pageResult.text || '';
-      if (kind !== 'google-doc' || text.trim()) return { kind, text };
-      emptyGoogleDoc = { kind, text: '' };
+      if (kind !== 'google-doc' || text.trim())
+        return { kind, text, sourceUrls: pageResult.sourceUrls };
+      emptyGoogleDoc = { kind, text: '', sourceUrls: pageResult.sourceUrls };
       continue;
     }
     if (pageResult?.status) lastStatus = pageResult.status;
-    const fallbackTimeout = deadline - Date.now();
-    if (fallbackTimeout <= 0) break;
-    let response: Response;
+    check();
+    if (Date.now() >= deadline) throw documentFetchError();
+    const attempt = documentFetches.begin({
+      url: requestUrl,
+      context: { kind: file ? 'file' : 'worker', tabId },
+      deadline,
+      assertAllowed: checks.allowed,
+      assertCurrent: check,
+    });
     try {
-      response = await fetchWithTimeout(
-        requestUrl,
-        { credentials: 'include', redirect: 'follow' },
-        fallbackTimeout,
-      );
-    } catch {
-      continue;
-    }
-    if (response.url) assertTabAllowed({ url: response.url }, await denyPatterns());
-    if (!response.ok) {
-      lastStatus = response.status;
-      if (response.body) await response.body.cancel().catch(() => undefined);
-      continue;
-    }
-    if (kind === 'pdf') {
-      const result = await readResponseBytes(response, 45 * 1024 * 1024);
-      if (result.tooLarge)
-        throw Object.assign(
-          new Error('The PDF is too large to return. Open a smaller document and try again.'),
-          { code: 'BAD_REQUEST' },
+      let response: Response;
+      try {
+        response = await attempt.race(
+          fetch(requestUrl, {
+            credentials: 'include',
+            redirect: file ? 'error' : 'follow',
+            headers: file ? undefined : { Accept: attempt.accept },
+            signal: attempt.controller.signal,
+          }),
         );
-      if (!result.bytes) continue;
-      return { kind, base64: bytesToBase64(result.bytes) };
+      } catch {
+        attempt.check();
+        if (file) throw documentFetchError();
+        await checks.finish(attempt, undefined, 'network');
+        continue;
+      }
+      if (!response.ok) {
+        lastStatus = response.status;
+        await response.body?.cancel().catch(() => undefined);
+        await checks.finish(attempt, response.url, 'diagnostic');
+        continue;
+      }
+      const result = await attempt.race(
+        readResponseBytes(response, kind === 'pdf' ? 45 * 1024 * 1024 : MAX_SPECIAL_TEXT_BYTES),
+      );
+      attempt.check();
+      if (result.tooLarge) {
+        lastStatus = 413;
+        break;
+      }
+      if (!result.bytes) {
+        if (file) throw documentFetchError();
+        await checks.finish(attempt, response.url, 'network');
+        continue;
+      }
+      const sourceUrls = specialSourceUrls(...(await checks.finish(attempt, response.url)));
+      if (kind === 'pdf') return { kind, base64: bytesToBase64(result.bytes), sourceUrls };
+      const text = new TextDecoder().decode(result.bytes);
+      if (specialTextTooLarge(text)) {
+        lastStatus = 413;
+        break;
+      }
+      if (kind !== 'google-doc' || text.trim()) return { kind, text, sourceUrls };
+      emptyGoogleDoc = { kind, text: '', sourceUrls };
+    } finally {
+      attempt.controller.abort();
+      attempt.dispose();
     }
-    const result = await readResponseBytes(response, MAX_SPECIAL_TEXT_BYTES);
-    if (result.tooLarge)
-      throw Object.assign(
-        new Error(
-          'The exported document is too large to return. Open a smaller document and try again.',
-        ),
-        { code: 'BAD_REQUEST' },
-      );
-    if (!result.bytes) continue;
-    const text = new TextDecoder().decode(result.bytes);
-    if (specialTextTooLarge(text))
-      throw Object.assign(
-        new Error(
-          'The exported document is too large to return. Open a smaller document and try again.',
-        ),
-        { code: 'BAD_REQUEST' },
-      );
-    if (kind !== 'google-doc' || text.trim()) return { kind, text };
-    emptyGoogleDoc = { kind, text: '' };
   }
   if (lastStatus === 413)
     throw Object.assign(
-      new Error(
-        'The exported document is too large to return. Open a smaller document and try again.',
-      ),
+      new Error('The document is too large to return; open a smaller document and retry.'),
       { code: 'BAD_REQUEST' },
     );
   if (lastStatus)
     throw Object.assign(
       new Error(
-        `The page could not be fetched (${lastStatus}). Check that you can open it in the browser.`,
+        `The page could not be fetched (${lastStatus}); check that it opens in the browser and retry.`,
       ),
       { code: 'UNREADABLE' },
     );
   if (emptyGoogleDoc) return emptyGoogleDoc;
   throw Object.assign(
-    new Error('The document could not be fetched. Check that you can open it in the browser.'),
+    new Error('The document could not be fetched; check that it opens in the browser and retry.'),
     { code: 'UNREADABLE' },
   );
+}
+
+function specialSourceUrls(...urls: Array<string | undefined>): string[] {
+  return [
+    ...new Set(
+      urls
+        .filter((url): url is string => Boolean(url))
+        .map((url) => {
+          const parsed = new URL(url);
+          parsed.username = '';
+          parsed.password = '';
+          parsed.search = '';
+          parsed.hash = '';
+          return parsed.toString();
+        }),
+    ),
+  ];
 }
 
 async function fetchSpecialInPage(
   tabId: number,
   url: string,
   kind: 'pdf' | 'google-doc' | 'google-sheet' | 'google-slide',
-  timeoutMs: number,
-): Promise<
-  { ok: boolean; url?: string; status?: number; text?: string; base64?: string } | undefined
-> {
+  checks: SpecialFetchChecks,
+): Promise<SpecialPageResult | undefined> {
+  let metadata: chrome.scripting.InjectionResult<DocumentPageResult> | undefined;
   try {
-    const executions = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: async (request: { url: string; kind: string; timeoutMs: number }) => {
-        try {
-          const response = await fetch(request.url, {
-            credentials: 'include',
-            redirect: 'follow',
-            signal: AbortSignal.timeout(Math.max(1, request.timeoutMs)),
-          });
-          if (!response.ok) {
-            if (response.body) await response.body.cancel().catch(() => undefined);
-            return { ok: false, url: response.url, status: response.status };
-          }
-          const readBytes = async (limit: number) => {
-            const contentLength = Number(response.headers.get('content-length'));
-            if (Number.isFinite(contentLength) && contentLength > limit) {
-              if (response.body) await response.body.cancel().catch(() => undefined);
-              return { tooLarge: true as const };
-            }
-            const reader = response.body?.getReader();
-            if (!reader) {
-              const bytes = new Uint8Array(await response.arrayBuffer());
-              return bytes.byteLength > limit
-                ? { tooLarge: true as const }
-                : { bytes, tooLarge: false as const };
-            }
-            const chunks: Uint8Array[] = [];
-            let size = 0;
-            try {
-              while (true) {
-                const next = await reader.read();
-                if (next.done) break;
-                const chunk = new Uint8Array(next.value);
-                size += chunk.byteLength;
-                if (size > limit) {
-                  await reader.cancel();
-                  return { tooLarge: true as const };
-                }
-                chunks.push(chunk);
-              }
-            } catch {
-              await reader.cancel().catch(() => undefined);
-              return { tooLarge: false as const };
-            }
-            const bytes = new Uint8Array(size);
-            let offset = 0;
-            for (const chunk of chunks) {
-              bytes.set(chunk, offset);
-              offset += chunk.byteLength;
-            }
-            return { bytes, tooLarge: false as const };
-          };
-          if (request.kind === 'pdf') {
-            const result = await readBytes(45 * 1024 * 1024);
-            if (result.tooLarge) return { ok: false, url: response.url, status: 413 };
-            if (!result.bytes) return undefined;
-            const bytes = result.bytes;
-            let binary = '';
-            for (let offset = 0; offset < bytes.length; offset += 0x8000)
-              binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-            return { ok: true, url: response.url, base64: btoa(binary) };
-          }
-          const result = await readBytes(32 * 1024 * 1024);
-          if (result.tooLarge || !result.bytes)
-            return { ok: false, url: response.url, status: 413 };
-          const text = new TextDecoder().decode(result.bytes);
-          if (
-            new TextEncoder().encode(text).byteLength > 32 * 1024 * 1024 ||
-            new TextEncoder().encode(JSON.stringify({ text })).byteLength > 48 * 1024 * 1024
-          )
-            return { ok: false, url: response.url, status: 413 };
-          return { ok: true, url: response.url, text };
-        } catch {
-          return undefined;
-        }
-      },
-      args: [{ url, kind, timeoutMs }],
-    });
-    return executions[0]?.result;
+    [metadata] = await fetchWithinDeadline(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        func: documentPageFetch,
+        args: [{ action: 'metadata' }],
+      }),
+      checks.deadline,
+    );
   } catch {
+    checks.check();
+    await fetchWithinDeadline(verifyReadTab(tabId, checks.tabUrl), checks.deadline);
     return undefined;
+  }
+  checks.check();
+  if (
+    !metadata?.documentId ||
+    metadata.result?.outcome !== 'metadata' ||
+    comparableTabUrl(metadata.result.url) !== comparableTabUrl(checks.tabUrl)
+  )
+    throw documentFetchError();
+  const target = { tabId, documentIds: [metadata.documentId] };
+  const file = new URL(url).protocol === 'file:';
+  const attempt = documentFetches.begin({
+    url,
+    context: file
+      ? { kind: 'file', tabId }
+      : {
+          kind: 'page',
+          tabId,
+          documentId: metadata.documentId,
+          origin: metadata.result.origin || '',
+        },
+    deadline: checks.deadline,
+    assertAllowed: checks.allowed,
+    assertCurrent: checks.check,
+    onAbort: (key) => {
+      void chrome.scripting
+        .executeScript({ target, func: documentPageFetch, args: [{ action: 'cancel', key }] })
+        .catch(() => undefined);
+    },
+  });
+  const key = attempt.key;
+  try {
+    const [prepared] = await attempt.race(
+      chrome.scripting.executeScript({
+        target,
+        func: documentPageFetch,
+        args: [{ action: 'prepare', key, deadline: checks.deadline }],
+      }),
+    );
+    attempt.check();
+    if (prepared?.documentId !== metadata.documentId || prepared.result?.outcome !== 'prepared')
+      throw documentFetchError();
+    const [execution] = await attempt.race(
+      chrome.scripting.executeScript({
+        target,
+        world: 'ISOLATED',
+        func: documentPageFetch,
+        args: [
+          {
+            action: 'fetch',
+            key,
+            url,
+            kind,
+            accept: file ? undefined : attempt.accept,
+            deadline: checks.deadline,
+          },
+        ],
+      }),
+    );
+    attempt.check();
+    if (execution?.documentId !== metadata.documentId || !execution.result)
+      throw documentFetchError();
+    const result = execution.result;
+    if (result.outcome === 'network') {
+      if (file) {
+        // Local PDF pages can reject fetch while the extension still has file access.
+        checks.check();
+        await fetchWithinDeadline(verifyReadTab(tabId, checks.tabUrl), checks.deadline);
+        return undefined;
+      }
+      await checks.finish(attempt, undefined, 'network');
+      return undefined;
+    }
+    if (result.outcome !== 'response' || !result.url) throw documentFetchError();
+    if (result.status === 413)
+      throw Object.assign(
+        new Error('The document is too large to return; open a smaller document and retry.'),
+        { code: 'BAD_REQUEST' },
+      );
+    const sourceUrls = specialSourceUrls(
+      ...(await checks.finish(attempt, result.url, result.ok ? 'body' : 'diagnostic')),
+    );
+    return { ...result, sourceUrls };
+  } finally {
+    void chrome.scripting
+      .executeScript({ target, func: documentPageFetch, args: [{ action: 'cancel', key }] })
+      .catch(() => undefined);
+    attempt.dispose();
   }
 }
 
@@ -905,11 +1153,14 @@ async function snapshot(tabId: number) {
       { code: 'UNREADABLE' },
     );
   const special = specialKind(tab.url || '');
+  const expectedDocument = documentEpoch(tabId);
   if (special) {
     try {
       const specialData = await fetchSpecial(tab.id!, tab.url || '', special);
       const current = await verifyReadTab(tab.id!, tab.url || '');
       return {
+        tabId,
+        documentEpoch: expectedDocument,
         url: current.url || '',
         title: current.title || '',
         contentType: special === 'pdf' ? 'application/pdf' : 'text/plain',
@@ -960,6 +1211,8 @@ async function snapshot(tabId: number) {
       const specialData = await fetchSpecial(tab.id!, result.url, 'pdf');
       await verifyReadTab(tab.id!, result.url);
       return {
+        tabId,
+        documentEpoch: expectedDocument,
         url: result.url,
         title: result.title,
         contentType: result.contentType,
@@ -967,7 +1220,7 @@ async function snapshot(tabId: number) {
         reloaded,
       };
     }
-    return { ...result, reloaded };
+    return { ...result, reloaded, tabId, documentEpoch: expectedDocument };
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error) throw error;
     throw Object.assign(
@@ -979,7 +1232,7 @@ async function snapshot(tabId: number) {
   }
 }
 
-async function queryTab(tabId: number, selector: string, html: boolean, limit: number) {
+async function queryTab(tabId: number, selector: string, html: boolean, limit: number, offset = 0) {
   let tab = await tabInfo(tabId);
   if (tab.status !== 'loading' && !pageIsReadable(tab.url))
     throw Object.assign(
@@ -1006,37 +1259,96 @@ async function queryTab(tabId: number, selector: string, html: boolean, limit: n
         { code: 'UNREADABLE' },
       );
   }
+  const expectedDocument = documentEpoch(tabId);
   try {
     const executions = await chrome.scripting.executeScript({
       target: { tabId },
-      func: (value: { selector: string; html: boolean; limit: number; maxValueChars: number }) => ({
-        url: location.href,
-        values: Array.from(document.querySelectorAll(value.selector))
-          .slice(0, value.limit)
-          .map((node) => {
-            const text = value.html
-              ? (node as Element).outerHTML
-              : (node as HTMLElement).innerText || node.textContent || '';
-            return text.length > value.maxValueChars
-              ? `${text.slice(0, value.maxValueChars)}…`
-              : text;
-          }),
-      }),
+      func: (value: {
+        selector: string;
+        html: boolean;
+        limit: number;
+        maxValueChars: number;
+        offset: number;
+      }) => {
+        const nodes = document.querySelectorAll(value.selector);
+        const count = Math.min(nodes.length, value.limit);
+        const values: string[] = [];
+        let position = 0;
+        let output = '';
+        let hasMore = false;
+        for (let index = 0; index < count; index++) {
+          const node = nodes[index];
+          const raw = value.html
+            ? node.outerHTML
+            : typeof (node as HTMLElement).innerText === 'string'
+              ? (node as HTMLElement).innerText
+              : node.textContent || '';
+          // Redact the whole element before a chunk can split a URL or its credentials.
+          const text = raw
+            .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+            .replace(/(https?:\/\/|(?<!:)\/\/)[^/\s?#<>]*@/gi, '$1')
+            .replace(/https?:\/\/[^\s<>"']+/gi, (candidate) => {
+              try {
+                const parsed = new URL(candidate);
+                if (!parsed.username && !parsed.password) return candidate;
+                parsed.username = '';
+                parsed.password = '';
+                return parsed.toString();
+              } catch {
+                return candidate;
+              }
+            });
+          const numbered = `${index ? '\n\n' : ''}${index + 1}. ${text}`;
+          const end = position + numbered.length;
+          if (value.offset < end) {
+            const start = Math.max(0, value.offset - position);
+            let take = Math.min(numbered.length - start, value.maxValueChars - output.length);
+            const last = numbered.charCodeAt(start + take - 1);
+            if (last >= 0xd800 && last <= 0xdbff && start + take < numbered.length) take--;
+            output += numbered.slice(start, start + take);
+            hasMore = start + take < numbered.length || index + 1 < count;
+            if (hasMore && output.length >= value.maxValueChars - 1) break;
+          }
+          if (value.offset === 0 && end <= value.maxValueChars) values.push(text);
+          position = end;
+        }
+        return {
+          url: location.href,
+          text: output,
+          hasMore,
+          values: value.offset === 0 && !hasMore ? values : undefined,
+          outOfRange: !output && value.offset > position,
+        };
+      },
       args: [
         {
           selector,
           html,
           limit: Math.max(1, Math.min(100, limit)),
           maxValueChars: MAX_QUERY_VALUE_CHARS,
+          offset,
         },
       ],
     });
-    const result = executions[0]?.result as { url?: string; values?: string[] } | undefined;
+    const result = executions[0]?.result as
+      | { url?: string; values?: string[]; text?: string; hasMore?: boolean; outOfRange?: boolean }
+      | undefined;
     if (!result)
       throw Object.assign(new Error('The page returned no query results.'), { code: 'UNREADABLE' });
     assertTabAllowed(result || {}, await denyPatterns());
     await verifyReadTab(tabId, result.url || tab.url);
-    return { url: result.url || tab.url, values: result.values || [] };
+    if (result.outOfRange)
+      throw Object.assign(new Error('The query offset is past the output; retry with offset 0.'), {
+        code: 'BAD_REQUEST',
+      });
+    return {
+      tabId,
+      documentEpoch: expectedDocument,
+      url: result.url || tab.url,
+      text: result.text || '',
+      hasMore: result.hasMore === true,
+      values: result.values,
+    };
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error) throw error;
     throw Object.assign(new Error('The CSS selector could not be run on this page.'), {
@@ -1076,26 +1388,93 @@ async function selection(tabId?: number) {
         code: 'UNREADABLE',
       });
   }
+  const expectedDocument = documentEpoch(id);
   try {
     const executions = await chrome.scripting.executeScript({
       target: { tabId: id },
       func: (maxChars: number) => {
-        const active = document.activeElement as HTMLInputElement | HTMLTextAreaElement | null;
+        const shadowRoot = (node: Node | null | undefined) =>
+          node instanceof HTMLElement ? chrome.dom.openOrClosedShadowRoot(node) : null;
+        let active = document.activeElement;
+        for (;;) {
+          const inner = shadowRoot(active)?.activeElement;
+          if (!inner) break;
+          active = inner;
+        }
+        if (active instanceof HTMLInputElement && active.type === 'password')
+          return { url: location.href, password: true };
+        const selected = window.getSelection();
+        if (selected) {
+          const roots: ShadowRoot[] = [];
+          const composed = typeof selected.getComposedRanges === 'function';
+          const scopes = [selected];
+          let scopeIndex = 0;
+          for (;;) {
+            const scoped = scopes[scopeIndex];
+            const ranges = composed
+              ? selected.getComposedRanges({ shadowRoots: roots })
+              : Array.from({ length: scoped.rangeCount }, (_, index) => scoped.getRangeAt(index));
+            let discovered = false;
+            for (const range of ranges) {
+              const first = range.startContainer.childNodes[range.startOffset];
+              // Chromium retargets a retained control selection to the boundary around its input.
+              const control =
+                range.startContainer === range.endContainer &&
+                (range.endOffset === range.startOffset + 1 ||
+                  (!composed && range.collapsed && scoped.type === 'Range'));
+              if (control && first instanceof HTMLInputElement && first.type === 'password')
+                return { url: location.href, password: true };
+              for (const node of [
+                range.startContainer,
+                first,
+                range.endContainer,
+                range.collapsed ? first : range.endContainer.childNodes[range.endOffset - 1],
+              ]) {
+                const root = shadowRoot(node);
+                if (!root || roots.includes(root)) continue;
+                roots.push(root);
+                discovered = true;
+                if (!composed) {
+                  const inner = (
+                    root as ShadowRoot & { getSelection?: () => Selection | null }
+                  ).getSelection?.();
+                  if (!inner) throw new Error('The browser could not identify the selection.');
+                  scopes.push(inner);
+                }
+              }
+            }
+            if (composed ? !discovered : ++scopeIndex === scopes.length) break;
+          }
+        }
         let text = '';
-        if (active && 'selectionStart' in active && active.selectionStart !== active.selectionEnd)
+        if (
+          (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) &&
+          active.selectionStart !== active.selectionEnd
+        )
           text = active.value.slice(active.selectionStart || 0, active.selectionEnd || 0);
-        else text = window.getSelection()?.toString() || '';
+        else text = selected?.toString() || '';
         if (text.length > maxChars) text = `${text.slice(0, maxChars)}…`;
         return { url: location.href, text };
       },
       args: [MAX_SELECTION_CHARS],
     });
-    const result = executions[0]?.result as { url?: string; text?: string } | undefined;
+    const result = executions[0]?.result as
+      { url?: string; text?: string; password?: boolean } | undefined;
     if (!result)
       throw Object.assign(new Error('The page returned no selection.'), { code: 'UNREADABLE' });
+    if (result.password)
+      throw Object.assign(
+        new Error('Password selections are private; select other text and try again.'),
+        { code: 'DENIED' },
+      );
     assertTabAllowed(result || {}, await denyPatterns());
     await verifyReadTab(id, result.url || tab.url);
-    return { tabId: id, url: result.url || tab.url, text: String(result.text || '') };
+    return {
+      tabId: id,
+      documentEpoch: expectedDocument,
+      url: result.url || tab.url,
+      text: String(result.text || ''),
+    };
   } catch (error) {
     if (error && typeof error === 'object' && 'code' in error) throw error;
     throw Object.assign(new Error('The page selection could not be read.'), { code: 'UNREADABLE' });
@@ -1109,6 +1488,7 @@ async function screenshot(windowId?: number) {
       : await chrome.windows.get(windowId);
   if (window.id === undefined)
     throw Object.assign(new Error('No browser window was found.'), { code: 'TAB_NOT_FOUND' });
+  const expectedActivation = activationVersions.get(window.id) ?? 0;
   const active = await chrome.tabs.query({ windowId: window.id, active: true });
   const tab = active[0];
   if (!tab?.id)
@@ -1125,6 +1505,7 @@ async function screenshot(windowId?: number) {
       new Error('The visible tab is hidden by the denylist. Choose a different window.'),
       { code: 'DENIED' },
     );
+  const expectedDocument = documentEpoch(tab.id);
   try {
     const dataUrl = await chrome.tabs.captureVisibleTab(window.id, { format: 'png' });
     if (dataUrl.length > 60 * 1024 * 1024)
@@ -1135,15 +1516,22 @@ async function screenshot(windowId?: number) {
         { code: 'BAD_REQUEST' },
       );
     const after = (await chrome.tabs.query({ windowId: window.id, active: true }))[0];
-    if (!after?.id || after.id !== tab.id || after.url !== tab.url)
+    const currentPatterns = await denyPatterns();
+    if (
+      !after?.id ||
+      after.id !== tab.id ||
+      after.url !== tab.url ||
+      (activationVersions.get(window.id) ?? 0) !== expectedActivation
+    )
       throw Object.assign(
         new Error('The visible tab changed while capturing. Try the screenshot again.'),
         { code: 'TIMEOUT' },
       );
-    assertTabAllowed(after, await denyPatterns());
+    assertTabAllowed(after, currentPatterns);
     return {
       windowId: window.id,
       tabId: after.id,
+      documentEpoch: expectedDocument,
       title: after.title || '',
       url: after.url || '',
       dataUrl,
@@ -1159,6 +1547,7 @@ async function screenshot(windowId?: number) {
 
 async function handleRequest(message: RequestMessage, port: chrome.runtime.Port) {
   if (!isNativeRequest(message)) return;
+  const expectedPauseEpoch = message.params?.pauseEpoch ?? pauseEpoch();
   inFlight++;
   setBusy(true);
   try {
@@ -1171,10 +1560,11 @@ async function handleRequest(message: RequestMessage, port: chrome.runtime.Port)
       );
     if (protocolError)
       throw Object.assign(new Error(protocolError), { code: 'EXTENSION_DISCONNECTED' });
-    if (await paused())
-      throw Object.assign(new Error('cobrowser is paused. Turn it on in the extension popup.'), {
-        code: 'PAUSED',
+    if (typeof expectedPauseEpoch !== 'string' || expectedPauseEpoch.length > 100)
+      throw Object.assign(new Error('The helper sent an invalid pause token; retry the command.'), {
+        code: 'BAD_REQUEST',
       });
+    await assertNotPaused(expectedPauseEpoch);
     let result: any;
     if (message.method === 'tabs') result = await tabList();
     else if (message.method === 'tab') result = await tabInfo(Number(message.params?.id));
@@ -1185,6 +1575,7 @@ async function handleRequest(message: RequestMessage, port: chrome.runtime.Port)
         String(message.params?.selector || ''),
         Boolean(message.params?.html),
         Number(message.params?.limit) || 20,
+        Number(message.params?.offset) || 0,
       );
     else if (message.method === 'selection')
       result = await selection(
@@ -1195,8 +1586,8 @@ async function handleRequest(message: RequestMessage, port: chrome.runtime.Port)
         message.params?.windowId === undefined ? undefined : Number(message.params.windowId),
       );
     else if (message.method === 'guard') {
-      await assertGuardAllowed(message.params);
-      result = {};
+      const access = await assertGuardAllowed(message.params);
+      result = { pauseEpoch: expectedPauseEpoch, access };
     } else
       throw Object.assign(
         new Error('Unknown extension request. Use a supported cobrowser command.'),
@@ -1204,12 +1595,10 @@ async function handleRequest(message: RequestMessage, port: chrome.runtime.Port)
           code: 'BAD_REQUEST',
         },
       );
-    await assertResultAllowed(result);
-    // Denylist traversal is asynchronous, so pause must be checked after it too.
-    if (await paused())
-      throw Object.assign(new Error('cobrowser is paused. Turn it on in the extension popup.'), {
-        code: 'PAUSED',
-      });
+    const recheckDocuments = await assertResultAllowed(result);
+    await assertNotPaused(expectedPauseEpoch);
+    recheckDocuments();
+    if (message.method === 'guard') assertGuardAccess(result.access);
     send({ id: message.id, ok: true, result }, port);
   } catch (error: any) {
     errorResponse(

@@ -1,19 +1,39 @@
-export function splitPages(text: string, maxChars: number): string[] {
-  const limit = Number.isFinite(maxChars) && maxChars >= 1 ? Math.floor(maxChars) : 1;
-  if (text.length <= limit) return [text];
-  const paragraphs = text.split(/\n\s*\n/);
-  const pages: string[] = [];
-  let current = '';
-  for (const paragraph of paragraphs) {
-    if (paragraph.length > limit) {
-      if (current) (pages.push(current), (current = ''));
-      for (let i = 0; i < paragraph.length; i += limit) pages.push(paragraph.slice(i, i + limit));
-    } else if (!current) current = paragraph;
-    else if (current.length + 2 + paragraph.length <= limit) current += `\n\n${paragraph}`;
-    else (pages.push(current), (current = paragraph));
+type TextSize = (text: string) => number;
+const characterCount: TextSize = (text) => text.length;
+
+export const jsonTextSize: TextSize = (text) => JSON.stringify(text).length - 2;
+
+function boundedPrefix(text: string, limit: number, size: TextSize): string {
+  let length = 0;
+  let used = 0;
+  for (const character of text) {
+    const cost = size(character);
+    if (used + cost > limit) break;
+    used += cost;
+    length += character.length;
   }
-  if (current || !pages.length) pages.push(current);
-  return pages;
+  return text.slice(0, length);
+}
+
+export function splitPages(text: string, maxChars: number, size = characterCount): string[] {
+  const limit = Number.isFinite(maxChars) && maxChars >= 1 ? Math.floor(maxChars) : 1;
+  if (size(text) <= limit) return [text];
+  const pages: string[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    let part =
+      boundedPrefix(text.slice(offset), limit, size) ||
+      String.fromCodePoint(text.codePointAt(offset)!);
+    if (offset + part.length < text.length) {
+      let boundary = 0;
+      for (const match of part.matchAll(/\n\s*\n/g))
+        if (part.slice(0, match.index).trim()) boundary = match.index + match[0].length;
+      if (boundary) part = part.slice(0, boundary);
+    }
+    pages.push(part);
+    offset += part.length;
+  }
+  return pages.length ? pages : [''];
 }
 
 export function capText(
@@ -21,22 +41,33 @@ export function capText(
   maxChars: number,
   nextCommand?: string,
   label = 'more',
+  size = characterCount,
 ): { text: string; truncated: boolean } {
-  if (text.length <= maxChars) return { text, truncated: false };
+  if (size(text) <= maxChars) return { text, truncated: false };
   const suffix = nextCommand ? `\n\n${label}: ${nextCommand}` : '';
-  if (suffix.length >= maxChars) return { text: suffix.slice(0, maxChars), truncated: true };
-  const take = Math.max(0, maxChars - suffix.length);
-  return { text: `${text.slice(0, take)}${suffix}`, truncated: true };
+  if (size(suffix) > maxChars)
+    return {
+      text: boundedPrefix(
+        `Raise maxChars to ${size(suffix) + 128} and retry.`,
+        Math.max(0, maxChars),
+        size,
+      ),
+      truncated: true,
+    };
+  const take = Math.max(0, maxChars - size(suffix));
+  return { text: `${boundedPrefix(text, take, size)}${suffix}`, truncated: true };
 }
 
-function capEmbeddedText(text: string, maxChars: number): string {
+export function capContinuationText(text: string, maxChars: number): string {
   const continuation = /\n\n(next|more): ([^\n]+)$/.exec(text);
-  if (!continuation) return text.slice(0, maxChars);
-  const suffix = `\n\n${continuation[1]}: ${continuation[2]}`;
-  if (suffix.length > maxChars) return '';
+  if (!continuation) return boundedPrefix(text, maxChars, characterCount);
   const prefix = text.slice(0, continuation.index);
-  if (prefix.length + suffix.length <= maxChars) return `${prefix}${suffix}`;
-  return `${prefix.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`;
+  return capText(
+    prefix + `\n\n${continuation[1]}: ${continuation[2]}`,
+    maxChars,
+    continuation[2],
+    continuation[1],
+  ).text;
 }
 
 /** Keep structured responses within the same cap as their human-readable text. */
@@ -58,7 +89,7 @@ export function capResponse(
     let best: Record<string, unknown> | undefined;
     while (low <= high) {
       const middle = Math.floor((low + high) / 2);
-      const candidate = { ...withoutData, text: capEmbeddedText(original, middle) };
+      const candidate = { ...withoutData, text: capContinuationText(original, middle) };
       if (fits(candidate)) {
         best = candidate;
         low = middle + 1;
@@ -95,5 +126,8 @@ export function capResponse(
   if ('ok' in payload) minimal.ok = payload.ok;
   if ('error' in payload) minimal.error = payload.error;
   if (fits(minimal)) return minimal;
-  return 'ok' in payload ? { ok: payload.ok } : {};
+  const status = 'ok' in payload ? { ok: payload.ok } : {};
+  if (fits(status)) return status;
+  if (fits({})) return {};
+  throw new RangeError('A JSON object needs at least two characters.');
 }

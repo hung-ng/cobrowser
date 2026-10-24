@@ -45,6 +45,7 @@ function validRequestId(value: unknown): value is string | number | null | undef
 
 const idSchema = { type: 'integer', minimum: 0 };
 const MIN_MCP_RESPONSE_CHARS = 100;
+const MAX_CONCURRENT_TOOLS = 16;
 const maxCharsSchema = {
   type: 'integer',
   minimum: MIN_MCP_RESPONSE_CHARS,
@@ -162,6 +163,7 @@ const tools = [
           ],
         },
         page: { type: 'integer', minimum: 1 },
+        pageSize: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
         full: { type: 'boolean' },
         links: { type: 'boolean' },
         maxChars: maxCharsSchema,
@@ -194,6 +196,7 @@ const tools = [
         selector: { type: 'string', minLength: 1, pattern: '\\S', maxLength: 10_000 },
         html: { type: 'boolean' },
         limit: { type: 'integer', minimum: 1, maximum: 100 },
+        offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
         maxChars: maxCharsSchema,
       },
     },
@@ -432,65 +435,47 @@ function boundedScreenshotResponse(
 }
 
 export async function runMcp(browser?: string): Promise<void> {
-  let agent = 'mcp';
-  let client = new CobrowserClient({ agent, browser });
-  for await (const item of readMcpLines(process.stdin)) {
-    if (item.tooLarge) {
-      process.stdout.write(
-        `${failure(undefined, 'MCP requests must be smaller than 1 MB.', -32700)}\n`,
-      );
-      continue;
-    }
-    const line = item.line || '';
-    if (!line.trim()) continue;
-    let request: RpcRequest;
-    try {
-      request = JSON.parse(line) as RpcRequest;
-    } catch {
-      process.stdout.write(
-        `${failure(undefined, 'MCP input must be one JSON object per line.', -32700)}\n`,
-      );
-      continue;
-    }
-    if (!request || typeof request !== 'object' || Array.isArray(request)) {
-      process.stdout.write(`${failure(undefined, 'MCP input must be a JSON object.', -32600)}\n`);
-      continue;
-    }
-    if (!validRequestId(request.id)) {
-      process.stdout.write(
-        `${failure(undefined, 'MCP request id must be a string, number, or null.', -32600)}\n`,
-      );
-      continue;
-    }
-    if (typeof request.id === 'string' && request.id.length > MAX_RPC_ID_CHARS) {
-      process.stdout.write(`${failure(undefined, 'MCP request id is too long.', -32600)}\n`);
-      continue;
-    }
-    if (request.jsonrpc !== '2.0') {
-      process.stdout.write(`${failure(request.id, 'MCP jsonrpc must be "2.0".', -32600)}\n`);
-      continue;
-    }
-    if (typeof request.method !== 'string' || !request.method) {
-      process.stdout.write(`${failure(request.id, 'MCP request method is required.', -32600)}\n`);
-      continue;
-    }
-    if (request.method.startsWith('notifications/') || request.id === undefined) continue;
+  let client = new CobrowserClient({ agent: 'mcp', browser });
+  const active = new Map<string | number | null, { controller: AbortController }>();
+  const running = new Set<Promise<void>>();
+  let outputClosed = false;
+  const disconnect = () => {
+    outputClosed = true;
+    for (const request of active.values()) request.controller.abort();
+    process.stdin.destroy();
+  };
+  const write = (value: string): Promise<void> => {
+    if (outputClosed) return Promise.resolve();
+    return new Promise((resolve) => {
+      process.stdout.write(value, (error) => {
+        if (error) disconnect();
+        resolve();
+      });
+    });
+  };
+  process.stdout.on('error', disconnect);
+  process.stdout.on('close', disconnect);
+  const handle = async (request: RpcRequest, signal?: AbortSignal): Promise<void> => {
+    const currentClient = client;
+    const send = (value: string) => (signal?.aborted ? Promise.resolve() : write(value));
+    const requestBrowser = (command: string, body: Record<string, unknown>) =>
+      currentClient.request(command, body, { signal });
     try {
       if (request.method === 'initialize') {
-        agent = String(request.params?.clientInfo?.name || 'mcp');
+        const agent = String(request.params?.clientInfo?.name || 'mcp');
         client = new CobrowserClient({ agent, browser });
-        process.stdout.write(
+        await send(
           `${response(request.id, { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'cobrowser', version: VERSION } })}\n`,
         );
-        continue;
+        return;
       }
       if (request.method === 'ping') {
-        process.stdout.write(`${response(request.id, {})}\n`);
-        continue;
+        await send(`${response(request.id, {})}\n`);
+        return;
       }
       if (request.method === 'tools/list') {
-        process.stdout.write(`${response(request.id, { tools })}\n`);
-        continue;
+        await send(`${response(request.id, { tools })}\n`);
+        return;
       }
       if (request.method !== 'tools/call')
         throw Object.assign(new Error(`Unsupported MCP method: ${request.method}`), {
@@ -516,9 +501,20 @@ export async function runMcp(browser?: string): Promise<void> {
       if (!definition)
         throw Object.assign(new Error(`Unknown cobrowser tool: ${name}`), { rpcCode: -32602 });
       validateToolArguments(name, definition, args);
+      const maxChars = requestedMaxChars(args);
+      const responseId = boundedResponseId(request.id, maxChars, (candidate) =>
+        response(candidate, { content: [{ type: 'text', text: '' }] }),
+      );
+      // Reserve the RPC envelope before the helper chooses page boundaries.
+      const responseOverhead = Math.max(
+        0,
+        response(responseId, { content: [{ type: 'text', text: '' }] }).length -
+          JSON.stringify({ ok: true, text: '' }).length,
+      );
+      const commandArgs = { ...args, responseOverhead };
       let result;
       if (name === 'list_tabs') {
-        const body = { ...args };
+        const body = { ...commandArgs };
         if (typeof body.since === 'string') {
           try {
             body.sinceMs = parseDuration(body.since);
@@ -528,36 +524,37 @@ export async function runMcp(browser?: string): Promise<void> {
             });
           }
         }
-        result = await client.request('tabs', body);
+        result = await requestBrowser('tabs', body);
       } else if (name === 'read_tab')
-        result = await client.request('read', { ...args, ...(args.ids ? {} : { id: args.id }) });
-      else if (name === 'find_in_tab') result = await client.request('find', args);
-      else if (name === 'query_tab') result = await client.request('query', args);
-      else if (name === 'get_selection') result = await client.request('selection', args);
-      else if (name === 'read_log') result = await client.request('log', args);
+        result = await requestBrowser('read', {
+          ...commandArgs,
+          ...(args.ids ? {} : { id: args.id }),
+        });
+      else if (name === 'find_in_tab') result = await requestBrowser('find', commandArgs);
+      else if (name === 'query_tab') result = await requestBrowser('query', commandArgs);
+      else if (name === 'get_selection') result = await requestBrowser('selection', commandArgs);
+      else if (name === 'read_log') result = await requestBrowser('log', commandArgs);
       else if (name === 'screenshot') {
-        result = await client.request('screenshot', {
+        result = await requestBrowser('screenshot', {
           ...args,
           maxChars: MAX_SCREENSHOT_CHARS,
         });
         if (!result.ok) {
-          process.stdout.write(
+          await send(
             `${boundedToolErrorResponse(request.id, toolError(result, 'The screenshot failed.'), requestedMaxChars(args))}\n`,
           );
-          continue;
+          return;
         }
-        process.stdout.write(
-          `${boundedScreenshotResponse(request.id, result, requestedMaxChars(args))}\n`,
-        );
-        continue;
+        await send(`${boundedScreenshotResponse(request.id, result, requestedMaxChars(args))}\n`);
+        return;
       } else throw Object.assign(new Error(`Unknown cobrowser tool: ${name}`), { rpcCode: -32602 });
       if (!result.ok) {
-        process.stdout.write(
+        await send(
           `${boundedToolErrorResponse(request.id, toolError(result, 'The cobrowser request failed.'), requestedMaxChars(args))}\n`,
         );
-        continue;
+        return;
       }
-      process.stdout.write(`${boundedToolResponse(request.id, result, requestedMaxChars(args))}\n`);
+      await send(`${boundedToolResponse(request.id, result, requestedMaxChars(args))}\n`);
     } catch (error: any) {
       const code = typeof error?.code === 'string' ? `${normalizeErrorCode(error.code)}: ` : '';
       const rpcCode =
@@ -569,9 +566,88 @@ export async function runMcp(browser?: string): Promise<void> {
         suppliedArgs && typeof suppliedArgs === 'object' && !Array.isArray(suppliedArgs)
           ? requestedMaxChars(suppliedArgs)
           : MAX_CHARS;
-      process.stdout.write(
+      await send(
         `${boundedFailure(request.id, `${code}${cleanErrorMessage(error?.message, 'The cobrowser request failed.')}`, rpcCode, maxChars)}\n`,
       );
     }
+  };
+  try {
+    for await (const item of readMcpLines(process.stdin)) {
+      if (outputClosed) break;
+      if (item.tooLarge) {
+        await write(`${failure(undefined, 'MCP requests must be smaller than 1 MB.', -32700)}\n`);
+        continue;
+      }
+      const line = item.line || '';
+      if (!line.trim()) continue;
+      let request: RpcRequest;
+      try {
+        request = JSON.parse(line) as RpcRequest;
+      } catch {
+        await write(
+          `${failure(undefined, 'MCP input must be one JSON object per line.', -32700)}\n`,
+        );
+        continue;
+      }
+      if (!request || typeof request !== 'object' || Array.isArray(request)) {
+        await write(`${failure(undefined, 'MCP input must be a JSON object.', -32600)}\n`);
+        continue;
+      }
+      if (!validRequestId(request.id)) {
+        await write(
+          `${failure(undefined, 'MCP request id must be a string, number, or null.', -32600)}\n`,
+        );
+        continue;
+      }
+      if (typeof request.id === 'string' && request.id.length > MAX_RPC_ID_CHARS) {
+        await write(`${failure(undefined, 'MCP request id is too long.', -32600)}\n`);
+        continue;
+      }
+      if (request.jsonrpc !== '2.0') {
+        await write(`${failure(request.id, 'MCP jsonrpc must be "2.0".', -32600)}\n`);
+        continue;
+      }
+      if (typeof request.method !== 'string' || !request.method) {
+        await write(`${failure(request.id, 'MCP request method is required.', -32600)}\n`);
+        continue;
+      }
+      if (request.id === undefined && request.method === 'notifications/cancelled') {
+        const id = request.params?.requestId;
+        if (id !== undefined && validRequestId(id)) active.get(id!)?.controller.abort();
+        continue;
+      }
+      if (request.method.startsWith('notifications/') || request.id === undefined) continue;
+      if (request.method !== 'tools/call') {
+        await handle(request);
+        continue;
+      }
+      if (active.has(request.id)) {
+        await write(
+          `${boundedFailure(request.id, 'A request with this id is already in progress; use a different id.', -32600, requestedMaxChars(request.params?.arguments ?? {}))}\n`,
+        );
+        continue;
+      }
+      if (active.size >= MAX_CONCURRENT_TOOLS) {
+        await write(
+          `${boundedFailure(request.id, 'Too many browser requests are in progress; wait for one to finish and try again.', -32000, requestedMaxChars(request.params?.arguments ?? {}))}\n`,
+        );
+        continue;
+      }
+      const entry = { controller: new AbortController() };
+      active.set(request.id, entry);
+      const task = handle(request, entry.controller.signal).finally(() => {
+        if (active.get(request.id!) === entry) active.delete(request.id!);
+        running.delete(task);
+      });
+      running.add(task);
+    }
+    await Promise.all(running);
+  } catch (error) {
+    if (!outputClosed) throw error;
+  } finally {
+    disconnect();
+    await Promise.allSettled(running);
+    process.stdout.removeListener('error', disconnect);
+    process.stdout.removeListener('close', disconnect);
   }
 }

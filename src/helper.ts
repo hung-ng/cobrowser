@@ -5,8 +5,14 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { extensionBuildRevision } from './shared/extension-build.js';
 import process from 'node:process';
-import { capResponse, capText, splitPages } from './shared/paging.js';
+import {
+  capResponse,
+  capText as measuredCapText,
+  jsonTextSize,
+  splitPages,
+} from './shared/paging.js';
 import { filterTabs, siteForUrl, type TabInfo } from './shared/filters.js';
 import { flattenSections, isSectionNumber, sectionOutline } from './shared/sections.js';
 import {
@@ -51,6 +57,14 @@ interface RequestBody {
 interface GuardTab {
   id: number;
   url: string;
+  documentEpoch: string;
+}
+
+type GuardedTabInfo = TabInfo & { documentEpoch: string };
+
+interface GuardAccess {
+  policyEpoch: string;
+  tabs: Array<{ id: number; documentEpoch: string }>;
 }
 
 const SIMPLE_BROWSER_NAME = /^[a-z0-9][a-z0-9._-]*$/i;
@@ -61,6 +75,23 @@ const MAX_CACHE_BYTES = 128 * 1024 * 1024;
 const MAX_SELECTOR_CHARS = 10_000;
 const MAX_SEARCH_CHARS = 10_000;
 const MAX_READ_TABS = 200;
+const MIN_SOCKET_CHARS = 64;
+
+function capText(text: string, cap: number, next?: string, label = 'more') {
+  return measuredCapText(text, cap, next, label, jsonTextSize);
+}
+
+function responseCap(params: RequestBody): number {
+  const cap = maxCharsFor(params.maxChars);
+  if (cap < MIN_SOCKET_CHARS)
+    throw error('BAD_REQUEST', `Use maxChars of at least ${MIN_SOCKET_CHARS}.`);
+  const overhead = integerParam(params.responseOverhead, 'responseOverhead', 0, 0, cap - 12);
+  return cap - overhead;
+}
+
+function responseTextCap(params: RequestBody): number {
+  return Math.max(0, responseCap(params) - JSON.stringify({ ok: true, text: '' }).length);
+}
 
 function oneLine(value: unknown, maxLength = 200): string {
   return redactEmbeddedUrls(
@@ -72,7 +103,13 @@ function oneLine(value: unknown, maxLength = 200): string {
 }
 
 function requestAgent(value: string | string[] | undefined): string {
-  return oneLine(Array.isArray(value) ? value.join(',') : value || 'unknown', 120) || 'unknown';
+  let name = Array.isArray(value) ? value.join(',') : value || 'unknown';
+  try {
+    name = decodeURIComponent(name);
+  } catch {
+    /* Older clients may send a literal percent sign. */
+  }
+  return oneLine(name, 120) || 'unknown';
 }
 
 function homeDir(): string {
@@ -118,7 +155,10 @@ class Logger {
 }
 
 class ExtensionRouter {
-  constructor(private readonly diskExtensionVersion?: string) {}
+  constructor(
+    private readonly diskExtensionVersion?: string,
+    private readonly diskExtensionRevision?: string,
+  ) {}
   private nextId = 1;
   private pending = new Map<
     number,
@@ -127,12 +167,15 @@ class ExtensionRouter {
   private sendNative: ((value: unknown) => void) | undefined;
   onEvent: ((event: string, data: any) => void) | undefined;
   connected = false;
+  extensionRevision: string | undefined;
   setSender(send: (value: unknown) => void) {
     this.sendNative = send;
     this.connected = false;
+    this.extensionRevision = undefined;
   }
   disconnected() {
     this.connected = false;
+    this.extensionRevision = undefined;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(
@@ -162,8 +205,17 @@ class ExtensionRouter {
     }
     if (message.event) {
       if (message.event === 'hello') {
-        const data = message.data as { protocol?: number; version?: string } | undefined;
-        this.connected = data?.protocol === PROTOCOL_VERSION && data.version === VERSION;
+        const data = message.data as
+          { protocol?: number; version?: string; extensionRevision?: unknown } | undefined;
+        this.extensionRevision =
+          typeof data?.extensionRevision === 'string' &&
+          /^[a-f0-9]{64}$/.test(data.extensionRevision)
+            ? data.extensionRevision
+            : undefined;
+        this.connected =
+          data?.protocol === PROTOCOL_VERSION &&
+          data.version === VERSION &&
+          (!this.diskExtensionRevision || this.extensionRevision === this.diskExtensionRevision);
         logger.write(this.connected ? 'extension connected' : 'extension version mismatch');
         this.sendNative?.({
           event: 'hello_ack',
@@ -171,6 +223,7 @@ class ExtensionRouter {
             version: VERSION,
             protocol: PROTOCOL_VERSION,
             extensionVersion: this.diskExtensionVersion,
+            extensionRevision: this.diskExtensionRevision,
           },
         });
       }
@@ -228,12 +281,14 @@ class ExtensionRouter {
 
 interface CacheEntry {
   page: ConvertedPage;
+  sourceUrls: string[];
+  documentEpoch: string;
   at: number;
   bytes: number;
 }
 
 interface LoadedSnapshot {
-  snapshot: PageSnapshot;
+  snapshot: PageSnapshot & { documentEpoch: string };
   reloaded: boolean;
 }
 
@@ -306,6 +361,7 @@ function pageCommand(
   const args = [...commandPrefix(browser), 'read', String(tabId)];
   if (section !== undefined) args.push('--section', section);
   args.push('--page', String(page));
+  if (params.pageSize !== undefined) args.push('--page-size', String(params.pageSize));
   if (params.full) args.push('--full');
   if (params.links) args.push('--links');
   if (params.maxChars !== undefined) args.push('--max-chars', commandArg(params.maxChars));
@@ -316,6 +372,7 @@ function readCommand(tabIds: number[], params: RequestBody, browser?: string): s
   const args = [...commandPrefix(browser), 'read', ...tabIds.map(String)];
   if (params.section !== undefined) args.push('--section', commandArg(params.section));
   if (params.page !== undefined) args.push('--page', commandArg(params.page));
+  if (params.pageSize !== undefined) args.push('--page-size', commandArg(params.pageSize));
   if (params.full) args.push('--full');
   if (params.links) args.push('--links');
   if (params.maxChars !== undefined) args.push('--max-chars', commandArg(params.maxChars));
@@ -341,7 +398,11 @@ function sectionCommand(
 
 function tabsCommand(offset: number, params: RequestBody, browser?: string): string {
   const args = [...commandPrefix(browser), 'tabs'];
-  if (params.match) args.push('--match', commandArg(params.match));
+  if (params.match) {
+    const match = commandArg(params.match);
+    if (String(params.match).startsWith('--')) args.push(`--match=${match}`);
+    else args.push('--match', match);
+  }
   if (params.since) args.push('--since', commandArg(params.since));
   if (params.window !== undefined) args.push('--window', commandArg(params.window));
   if (params.active) args.push('--active');
@@ -357,7 +418,15 @@ function continuationMaxChars(maxChars: number): number {
 }
 
 function findCommand(tabId: number, query: string, maxChars: number, browser?: string): string {
-  return `${[...commandPrefix(browser), 'find', String(tabId), commandArg(query)].join(' ')} --max-chars ${continuationMaxChars(maxChars)}`;
+  return [
+    ...commandPrefix(browser),
+    'find',
+    String(tabId),
+    '--max-chars',
+    String(continuationMaxChars(maxChars)),
+    '--',
+    commandArg(query),
+  ].join(' ');
 }
 
 function queryCommand(
@@ -370,7 +439,8 @@ function queryCommand(
   const args = [...commandPrefix(browser), 'query', String(tabId), commandArg(selector)];
   if (params.html) args.push('--html');
   if (params.limit !== undefined) args.push('--limit', commandArg(params.limit));
-  args.push('--max-chars', String(continuationMaxChars(maxChars)));
+  if (params.offset !== undefined) args.push('--offset', commandArg(params.offset));
+  args.push('--max-chars', String(maxChars));
   return args.join(' ');
 }
 
@@ -385,6 +455,11 @@ function logCommand(limit: number, maxChars: number, browser?: string): string {
   return `${[...commandPrefix(browser), 'log', '--limit', String(limit)].join(' ')} --max-chars ${continuationMaxChars(maxChars)}`;
 }
 
+interface RenderedRead {
+  text: string;
+  pages?: number;
+}
+
 function pagedText(
   text: string,
   cap: number,
@@ -396,63 +471,101 @@ function pagedText(
   pageNumber?: number,
   browser?: string,
   documentPages?: string[],
-): string {
+): RenderedRead {
   const noteText = note ? `\n\n${note}` : '';
   const physicalPages = documentPages?.length ? documentPages : undefined;
-  let budget = Math.max(1, cap - prefix.length - noteText.length - 80);
-  let pages: string[] = physicalPages || [];
-  if (!physicalPages)
+  const fixedPages =
+    physicalPages ||
+    (params.pageSize === undefined ? undefined : splitPages(text, params.pageSize, jsonTextSize));
+  if (
+    params.pageSize === undefined &&
+    (!physicalPages || pageNumber === undefined) &&
+    jsonTextSize(prefix + text + noteText) <= cap
+  ) {
+    if (pageNumber !== undefined && pageNumber !== 1)
+      throw error(
+        'BAD_REQUEST',
+        `Page ${pageNumber} was not found. Choose a page from the previous response.`,
+      );
+    return { text: prefix + text + noteText, pages: physicalPages?.length ?? 1 };
+  }
+  const largerCap = { ...params, maxChars: continuationMaxChars(maxCharsFor(params.maxChars)) };
+  if (
+    jsonTextSize(
+      prefix + noteText + `\n\nnext: ${pageCommand(tabId, section, 2, params, browser)}`,
+    ) >= cap
+  )
+    return {
+      text: withContinuation(
+        '',
+        pageCommand(tabId, section, pageNumber || 1, largerCap, browser),
+        cap,
+        'more',
+      ),
+      pages: fixedPages?.length,
+    };
+  let budget = params.pageSize ?? Math.max(1, cap - jsonTextSize(prefix + noteText) - 80);
+  let pages: string[] = fixedPages || [];
+  if (!physicalPages && params.pageSize === undefined)
     for (let attempt = 0; attempt < 12; attempt++) {
-      pages = splitPages(text, budget);
-      const nextCommand = pageCommand(tabId, section, Math.max(2, pages.length), params, browser);
-      const nextLength = `\n\nnext: ${nextCommand}`.length;
-      const nextBudget = Math.max(1, cap - prefix.length - noteText.length - nextLength);
+      pages = splitPages(text, budget, jsonTextSize);
+      const nextCommand = pageCommand(
+        tabId,
+        section,
+        Math.max(2, pages.length),
+        { ...params, pageSize: budget },
+        browser,
+      );
+      const nextLength = jsonTextSize(`\n\nnext: ${nextCommand}`);
+      const nextBudget = Math.max(
+        1,
+        Math.min(budget, cap - jsonTextSize(prefix + noteText) - nextLength),
+      );
       if (nextBudget === budget) break;
       budget = nextBudget;
     }
+  const pageParams = physicalPages ? params : { ...params, pageSize: budget };
+  if (!fixedPages) pages = splitPages(text, budget, jsonTextSize);
   const start = pageNumber === undefined ? 0 : pageNumber - 1;
   if (start < 0 || start >= pages.length)
     throw Object.assign(
       new Error(`Page ${pageNumber} was not found. Choose a page from the previous response.`),
       { code: 'BAD_REQUEST' },
     );
-  const pageNeedsMore =
-    physicalPages && pages[start].length > Math.max(1, cap - prefix.length - noteText.length);
-  const nextPageWithLargerCap = pageNeedsMore
-    ? pageCommand(
-        tabId,
-        section,
-        start + 1,
-        { ...params, maxChars: continuationMaxChars(cap) },
-        browser,
-      )
-    : undefined;
   const next =
-    nextPageWithLargerCap ||
-    (start + 1 < pages.length
-      ? pageCommand(tabId, section, start + 2, params, browser)
-      : undefined);
+    start + 1 < pages.length
+      ? pageCommand(tabId, section, start + 2, pageParams, browser)
+      : undefined;
   const base = `${prefix}${pages[start]}${noteText}`;
-  if (!next) return capText(base, cap).text;
-  if (nextPageWithLargerCap) return capText(base, cap, next, 'more').text;
-  return withNext(base, next, cap);
+  if (jsonTextSize(base + (next ? `\n\nnext: ${next}` : '')) > cap)
+    return {
+      text: withContinuation(
+        '',
+        pageCommand(tabId, section, start + 1, largerCap, browser),
+        cap,
+        'more',
+      ),
+      pages: fixedPages?.length,
+    };
+  return { text: next ? withNext(base, next, cap) : capText(base, cap).text, pages: pages.length };
 }
 
 function withNext(text: string, command: string, cap: number): string {
-  const rendered = `${text}\n\nnext: ${command}`;
-  if (rendered.length <= cap) return rendered;
-  const suffix = `\n\nnext: ${command}`;
-  if (suffix.length >= cap) return suffix.slice(0, cap);
-  return `${text.slice(0, cap - suffix.length)}${suffix}`;
+  return withContinuation(text, command, cap, 'next');
 }
 
-function withAdditionalNext(text: string, command: string, cap: number): string {
+function withContinuation(text: string, command: string, cap: number, label: string): string {
+  const rendered = `${text}\n\n${label}: ${command}`;
+  return capText(rendered, cap, command, label).text;
+}
+
+function withAdditionalNext(text: string, command: string, cap: number): string | undefined {
   const continuation = /\n\n(next|more): ([^\n]+)$/.exec(text);
   if (!continuation || continuation[2] === command) return withNext(text, command, cap);
   const suffix = `\n\n${continuation[1]}: ${continuation[2]}\n\nalso: ${command}`;
-  if (suffix.length >= cap) return suffix.slice(0, cap);
+  if (jsonTextSize(suffix) > cap) return undefined;
   const prefix = text.slice(0, continuation.index);
-  return `${prefix.slice(0, cap - suffix.length)}${suffix}`;
+  return `${capText(prefix, cap - jsonTextSize(suffix)).text}${suffix}`;
 }
 
 function readBody(markdown: string, params: RequestBody): string {
@@ -566,13 +679,13 @@ function formatRead(
   params: RequestBody,
   note = page.note || '',
   browser?: string,
-): string {
+): RenderedRead {
   const sections = flattenSections(page.sections);
   const sectionCount = sections.some((section) => section.level > 0) ? sections.length : 0;
   const title = oneLine(page.title || tab.title || '(untitled)');
   const url = safeUrl(page.url);
   const header = `## ${tab.id} · ${siteForUrl(url)} · ${title}\n${url}\n${page.words.toLocaleString()} words · ${sectionCount} sections`;
-  const cap = maxCharsFor(params.maxChars);
+  const cap = responseTextCap(params);
   const prefix = `${header}\n\n`;
   const sectionNumber = params.section === undefined ? undefined : String(params.section);
   if (sectionNumber !== undefined && !isSectionNumber(sectionNumber))
@@ -606,43 +719,43 @@ function formatRead(
     );
   }
 
-  if (requestedPage !== undefined) {
-    return pagedText(
-      readBody(page.markdown, params),
-      cap,
-      prefix,
-      note,
-      tab.id,
-      undefined,
-      params,
-      requestedPage,
-      browser,
-      page.pagesAreDocumentPages ? page.pages : undefined,
-    );
-  }
-
-  if (page.words <= 1500) {
-    const body = readBody(page.markdown, params);
-    const next = pageCommand(tab.id, undefined, 1, params, browser);
-    return capText(`${prefix}${body}${note ? `\n\n${note}` : ''}`, cap, next, 'next').text;
+  const rendered = pagedText(
+    readBody(page.markdown, params),
+    cap,
+    prefix,
+    note,
+    tab.id,
+    undefined,
+    params,
+    requestedPage,
+    browser,
+    page.pagesAreDocumentPages ? page.pages.map((text) => readBody(text, params)) : undefined,
+  );
+  if (requestedPage !== undefined || page.words <= 1500) {
+    return rendered;
   }
 
   const outline = sectionOutline(page.sections);
   const hasHeadings = page.sections.some((section) => section.level > 0);
   if (!hasHeadings) {
-    const pages = splitPages(page.markdown, Math.max(1, cap - prefix.length - 80));
-    return withNext(
-      `${prefix}${pages.length} pages${note ? `\n\n${note}` : ''}`,
-      pageCommand(tab.id, undefined, 1, params, browser),
-      cap,
-    );
+    return {
+      text: withNext(
+        `${prefix}${rendered.pages === undefined ? 'Read a page with a larger character cap.' : `${rendered.pages} pages`}${note ? `\n\n${note}` : ''}`,
+        pageCommand(tab.id, undefined, 1, params, browser),
+        cap,
+      ),
+      pages: rendered.pages,
+    };
   }
   const firstSection = page.sections[0]?.number;
   const next =
     firstSection === undefined
       ? pageCommand(tab.id, undefined, 1, params, browser)
       : sectionCommand(tab.id, firstSection, params, browser);
-  return withNext(`${prefix}${outline}${note ? `\n\n${note}` : ''}`, next, cap);
+  return {
+    text: withNext(`${prefix}${outline}${note ? `\n\n${note}` : ''}`, next, cap),
+    pages: rendered.pages,
+  };
 }
 
 function compactTab(tab: TabInfo): Record<string, unknown> {
@@ -659,7 +772,7 @@ function compactTab(tab: TabInfo): Record<string, unknown> {
   };
 }
 
-function pageData(page: ConvertedPage): Record<string, unknown> {
+function pageData(page: ConvertedPage, pages: number | undefined): Record<string, unknown> {
   return {
     url: safeUrl(page.url),
     title: oneLine(pdfSafeText(page.title), 200),
@@ -670,7 +783,7 @@ function pageData(page: ConvertedPage): Record<string, unknown> {
       level,
       words,
     })),
-    pages: page.pages.length,
+    pages,
     note: page.note,
   };
 }
@@ -705,6 +818,42 @@ function guardUrl(value: unknown): string {
 }
 function guardUrlHash(value: unknown): string {
   return createHash('sha256').update(comparableGuardUrl(value)).digest('hex');
+}
+
+function requireDocumentEpoch(value: unknown): string {
+  if (typeof value !== 'string' || !value || value.length > 100)
+    throw error(
+      'EXTENSION_DISCONNECTED',
+      'The extension sent no document identity; run cobrowser setup and retry the command.',
+    );
+  return value;
+}
+
+function requireGuardAccess(value: unknown): GuardAccess {
+  const access = value as GuardAccess | undefined;
+  if (
+    !access ||
+    typeof access !== 'object' ||
+    typeof access.policyEpoch !== 'string' ||
+    !access.policyEpoch ||
+    access.policyEpoch.length > 100 ||
+    !Array.isArray(access.tabs) ||
+    access.tabs.length > 200 ||
+    access.tabs.some(
+      (tab) =>
+        !tab ||
+        !Number.isSafeInteger(tab.id) ||
+        tab.id < 0 ||
+        typeof tab.documentEpoch !== 'string' ||
+        !tab.documentEpoch ||
+        tab.documentEpoch.length > 100,
+    )
+  )
+    throw error(
+      'EXTENSION_DISCONNECTED',
+      'The extension sent invalid guard access metadata; run cobrowser setup and retry the command.',
+    );
+  return access;
 }
 
 function safeLogEntry(value: unknown): Record<string, unknown> | undefined {
@@ -784,9 +933,10 @@ function createHelperServer(options: HelperServerOptions): http.Server {
     });
     request.on('end', async () => {
       if (requestAborted) return;
+      let validatedCap = MAX_CHARS;
       const send = (status: number, payload: unknown) => {
         if (requestAborted || response.destroyed || response.writableEnded) return;
-        const body = JSON.stringify(payload);
+        const body = JSON.stringify(capResponse(payload as Record<string, unknown>, validatedCap));
         response.writeHead(status, {
           'content-type': 'application/json',
           'content-length': Buffer.byteLength(body),
@@ -807,6 +957,7 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             throw error('BAD_REQUEST', 'The request body is not valid JSON.');
           }
         }
+        validatedCap = responseCap(body);
         if (request.method !== 'POST' || !request.url?.startsWith('/v1/'))
           return send(404, {
             ok: false,
@@ -821,6 +972,27 @@ function createHelperServer(options: HelperServerOptions): http.Server {
           if (requestAborted || response.destroyed)
             throw error('BROWSER_OFFLINE', 'The client closed the request.');
         };
+        let requestPauseEpoch: string | undefined;
+        let pauseReady: Promise<void> | undefined;
+        const extensionRequest = async (
+          method: string,
+          params: Record<string, unknown>,
+          timeoutMs = 15_000,
+        ) => {
+          assertRequestActive();
+          // One token covers snapshots, conversion, logging, and every final guard.
+          pauseReady ??= router.request('guard', {}).then((result) => {
+            if (typeof result?.pauseEpoch !== 'string')
+              throw error(
+                'EXTENSION_DISCONNECTED',
+                'The extension sent no pause token; run cobrowser setup and retry the command.',
+              );
+            requestPauseEpoch = result.pauseEpoch;
+          });
+          await pauseReady;
+          assertRequestActive();
+          return router.request(method, { ...params, pauseEpoch: requestPauseEpoch }, timeoutMs);
+        };
         const ensureActive = async (urls: string[] = [], tabs: GuardTab[] = []) => {
           assertRequestActive();
           const guarded = urls.map((value) => guardUrl(value));
@@ -828,28 +1000,50 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             id: tab.id,
             url: guardUrl(tab.url),
             urlHash: guardUrlHash(tab.url),
+            documentEpoch: requireDocumentEpoch(tab.documentEpoch),
           }));
           const batches = Math.max(guarded.length, guardedTabs.length);
-          for (let index = 0; index < batches; index += 32)
-            await router.request(
-              'guard',
-              {
-                urls: guarded.slice(index, index + 32),
-                tabs: guardedTabs.slice(index, index + 32),
-              },
-              15_000,
-            );
-          if (!batches) await router.request('guard', {}, 15_000);
+          let access: GuardAccess | undefined;
+          let index = 0;
+          do {
+            let count = Math.min(32, batches - index);
+            const params = () => ({
+              urls: guarded.slice(index, index + count),
+              tabs: guardedTabs.slice(index, index + count),
+              access,
+            });
+            // Include escaping and accumulated identities in the native frame budget.
+            while (
+              count > 0 &&
+              Buffer.byteLength(
+                JSON.stringify({
+                  id: Number.MAX_SAFE_INTEGER,
+                  method: 'guard',
+                  params: { ...params(), pauseEpoch: requestPauseEpoch ?? 'x'.repeat(100) },
+                }),
+                'utf8',
+              ) >
+                MAX_HELPER_FRAME - 1_024
+            )
+              count--;
+            if (!count && index < batches)
+              throw error(
+                'BAD_REQUEST',
+                'The guard metadata is too large; read fewer tabs and retry the command.',
+              );
+            const result = await extensionRequest('guard', params(), 15_000);
+            access = requireGuardAccess(result.access);
+            index += count;
+          } while (index < batches);
           assertRequestActive();
         };
         if (command === 'restart') {
-          router.event('reload_extension');
-          const body = JSON.stringify({ ok: true, text: 'The extension is restarting.' });
-          response.writeHead(200, {
-            'content-type': 'application/json',
-            'content-length': Buffer.byteLength(body),
+          const reloadExtension = optionalBoolean(body.reloadExtension, 'reloadExtension') ?? true;
+          if (reloadExtension) router.event('reload_extension');
+          send(200, {
+            ok: true,
+            text: reloadExtension ? 'The extension is restarting.' : 'The helper is restarting.',
           });
-          response.end(body);
           setTimeout(() => void stop(), 100);
           return;
         }
@@ -861,6 +1055,7 @@ function createHelperServer(options: HelperServerOptions): http.Server {
               version: VERSION,
               protocol: PROTOCOL_VERSION,
               extensionVersion: extensionDiskVersion(home),
+              extensionRevision: router.extensionRevision,
             },
           });
         }
@@ -877,8 +1072,9 @@ function createHelperServer(options: HelperServerOptions): http.Server {
           body.active = optionalBoolean(body.active, 'active');
           const offset = integerParam(body.offset, 'offset', 0, 0);
           const limit = integerParam(body.limit, 'limit', 50, 1, 200);
-          const maxChars = maxCharsFor(body.maxChars);
-          const result = await router.request('tabs', body);
+          const maxChars = responseCap(body);
+          const textCap = responseTextCap(body);
+          const result = await extensionRequest('tabs', body);
           assertRequestActive();
           const tabs = result.tabs as TabInfo[];
           const selected = filterTabs(
@@ -887,15 +1083,32 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             result.frontWindowId,
           );
           const visible = selected.slice(offset, offset + limit);
-          const hasMore = offset + visible.length < selected.length;
-          const nextCommand = hasMore
-            ? tabsCommand(offset + visible.length, body, commandBrowser)
-            : undefined;
-          const rawText = [
-            ...visible.map(formatTabLine),
-            `${Math.min(offset + visible.length, selected.length)} of ${selected.length} tabs${result.hidden ? ` · ${result.hidden} hidden by denylist` : ''}${offset + visible.length < selected.length ? ` · more: ${nextCommand}` : ''}`,
-          ].join('\n');
-          const text = capText(rawText, maxChars, nextCommand).text;
+          const render = () => {
+            const end = offset + visible.length;
+            const next = end < selected.length ? tabsCommand(end, body, commandBrowser) : undefined;
+            return (
+              [
+                ...visible.map(formatTabLine),
+                `${Math.min(end, selected.length)} of ${selected.length} tabs${result.hidden ? ` · ${result.hidden} hidden by denylist` : ''}`,
+              ].join('\n') + (next ? `\n\nmore: ${next}` : '')
+            );
+          };
+          let text = render();
+          while (visible.length && jsonTextSize(text) > textCap) {
+            visible.pop();
+            text = render();
+          }
+          if (!visible.length && offset < selected.length)
+            text = withNext(
+              'The character cap is too small to list a tab.',
+              tabsCommand(
+                offset,
+                { ...body, maxChars: continuationMaxChars(maxCharsFor(body.maxChars)) },
+                commandBrowser,
+              ),
+              textCap,
+            );
+          else text = capText(text, textCap).text;
           const payload = capResponse(
             {
               ok: true,
@@ -911,7 +1124,11 @@ function createHelperServer(options: HelperServerOptions): http.Server {
           );
           await ensureActive(
             visible.map((tab) => tab.url),
-            visible.map((tab) => ({ id: tab.id, url: tab.url })),
+            visible.map((tab) => ({
+              id: tab.id,
+              url: tab.url,
+              documentEpoch: (tab as GuardedTabInfo).documentEpoch,
+            })),
           );
           return send(200, payload);
         }
@@ -919,7 +1136,7 @@ function createHelperServer(options: HelperServerOptions): http.Server {
           if (!Number.isSafeInteger(id))
             throw error('BAD_REQUEST', 'A tab id is required. Use cobrowser read <id>.');
           assertRequestActive();
-          const tab = (await router.request('tab', { id })) as TabInfo;
+          const tab = (await extensionRequest('tab', { id })) as GuardedTabInfo;
           assertRequestActive();
           const snapshotKey = `${id}:${tab.url}`;
           const key = `${snapshotKey}:${full ? 'full' : 'reader'}`;
@@ -930,9 +1147,18 @@ function createHelperServer(options: HelperServerOptions): http.Server {
               ? undefined
               : cache.get(key);
           let page: ConvertedPage;
+          let sourceUrls: string[] = [];
+          let documentEpoch: string;
           let reloaded = false;
-          if (cached && now - cached.at < CACHE_TTL_MS) page = cached.page;
-          else {
+          if (
+            cached &&
+            now - cached.at < CACHE_TTL_MS &&
+            cached.documentEpoch === requireDocumentEpoch(tab.documentEpoch)
+          ) {
+            page = cached.page;
+            sourceUrls = cached.sourceUrls;
+            documentEpoch = cached.documentEpoch;
+          } else {
             let pending = pendingReads.get(snapshotKey);
             let loading = pending?.promise;
             if (!loading) {
@@ -941,9 +1167,14 @@ function createHelperServer(options: HelperServerOptions): http.Server {
                 tab.discarded || tab.status === 'unloaded' || tab.status === 'loading';
               if (expectsReload) expectedReloads.add(token);
               loading = (async (): Promise<LoadedSnapshot> => {
-                let snapshot: PageSnapshot;
+                let snapshot: LoadedSnapshot['snapshot'];
                 try {
-                  snapshot = (await router.request('read', { id }, 20_000)) as PageSnapshot;
+                  snapshot = (await extensionRequest(
+                    'read',
+                    { id },
+                    20_000,
+                  )) as LoadedSnapshot['snapshot'];
+                  requireDocumentEpoch(snapshot.documentEpoch);
                 } finally {
                   expectedReloads.delete(token);
                 }
@@ -967,11 +1198,21 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             page = loadedSnapshot.snapshot.special
               ? convertSpecialSnapshot(loadedSnapshot.snapshot)
               : convertSnapshot(loadedSnapshot.snapshot, full);
+            sourceUrls = loadedSnapshot.snapshot.special?.sourceUrls ?? [];
+            documentEpoch = loadedSnapshot.snapshot.documentEpoch;
             reloaded = loadedSnapshot.reloaded;
             assertRequestActive();
             if (pending && invalidatedReads.has(pending.token))
               throw error('TIMEOUT', 'The tab changed while it was being read. Try again.');
-            cache.set(key, { page, at: Date.now(), bytes: pageCacheBytes(page) });
+            cache.set(key, {
+              page,
+              sourceUrls,
+              documentEpoch,
+              at: Date.now(),
+              bytes:
+                pageCacheBytes(page) +
+                sourceUrls.reduce((sum, url) => sum + Buffer.byteLength(url, 'utf8'), 0),
+            });
             pruneCache(cache);
           }
           assertRequestActive();
@@ -982,9 +1223,11 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             id,
             tab,
             page,
+            sourceUrls,
+            documentEpoch,
             reloaded,
             note,
-            text: render ? formatRead(tab, page, body, note, commandBrowser) : '',
+            rendered: render ? formatRead(tab, page, body, note, commandBrowser) : undefined,
           };
         };
         if (command === 'read') {
@@ -997,9 +1240,12 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             throw error('BAD_REQUEST', 'A tab id is required. Use cobrowser read <id>.');
           body.section = sectionParam(body.section);
           if (body.page !== undefined) body.page = integerParam(body.page, 'page', 1, 1);
+          if (body.pageSize !== undefined)
+            body.pageSize = integerParam(body.pageSize, 'pageSize', 1, 1);
           body.full = optionalBoolean(body.full, 'full');
           body.links = optionalBoolean(body.links, 'links');
-          const maxChars = maxCharsFor(body.maxChars);
+          const maxChars = responseCap(body);
+          const textCap = responseTextCap(body);
           const items: Array<{
             id: number;
             data: Record<string, unknown>;
@@ -1016,26 +1262,38 @@ function createHelperServer(options: HelperServerOptions): http.Server {
               break;
             }
             const item = await readOne(ids[index], body.full === true, true);
-            const candidate = text ? `${text}\n\n${item.text}` : item.text;
-            // Keep only response metadata after each converted page is rendered.
-            items.push({
-              id: item.id,
-              data: pageData(item.page),
-              url: safeUrl(item.page.url),
-              chars: item.text.length,
-            });
-            guardUrls.push(item.page.url);
-            guardTabs.push({ id: item.id, url: item.page.url });
-            if (candidate.length > maxChars) {
+            const rendered = item.rendered!;
+            const candidate = text ? `${text}\n\n${rendered.text}` : rendered.text;
+            if (jsonTextSize(candidate) > textCap) {
               remaining = readCommand(ids.slice(index), body, commandBrowser);
               break;
             }
+            // Keep only response metadata after each converted page is rendered.
+            items.push({
+              id: item.id,
+              data: pageData(item.page, rendered.pages),
+              url: safeUrl(item.page.url),
+              chars: rendered.text.length,
+            });
+            guardUrls.push(item.page.url, ...item.sourceUrls);
+            guardTabs.push({ id: item.id, url: item.page.url, documentEpoch: item.documentEpoch });
             text = candidate;
           }
-          text =
-            remaining && continuationCommand(text) !== remaining
-              ? withAdditionalNext(text, remaining, maxChars)
-              : capText(text, maxChars).text;
+          if (remaining && continuationCommand(text) !== remaining) {
+            const combined = withAdditionalNext(text, remaining, textCap);
+            const original = text.replace(/\n\n(?:next|more): [^\n]+$/, '');
+            if (combined !== undefined && combined.startsWith(original)) text = combined;
+            else
+              text = withNext(
+                '',
+                readCommand(
+                  ids,
+                  { ...body, maxChars: continuationMaxChars(maxCharsFor(body.maxChars)) },
+                  commandBrowser,
+                ),
+                textCap,
+              );
+          } else text = capText(text, textCap).text;
           await ensureActive(guardUrls, guardTabs);
           for (const item of items)
             await recordRead({
@@ -1068,6 +1326,7 @@ function createHelperServer(options: HelperServerOptions): http.Server {
           const query = (boundedText(body.query, 'query', MAX_SEARCH_CHARS) || '').trim();
           if (!query) throw error('BAD_REQUEST', 'A search phrase is required.');
           const maxChars = maxCharsFor(body.maxChars);
+          const textCap = responseTextCap(body);
           const item = await readOne(id);
           const matches = findInMarkdown(readBody(item.page.markdown, {}), query);
           const text = matches.length
@@ -1077,7 +1336,10 @@ function createHelperServer(options: HelperServerOptions): http.Server {
                 )
                 .join('\n')
             : `No matches for ${JSON.stringify(query)}.`;
-          await ensureActive([item.page.url], [{ id, url: item.page.url }]);
+          await ensureActive(
+            [item.page.url, ...item.sourceUrls],
+            [{ id, url: item.page.url, documentEpoch: item.documentEpoch }],
+          );
           await recordRead({
             time: new Date().toISOString(),
             browser,
@@ -1087,7 +1349,10 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             url: safeUrl(item.page.url),
             chars: text.length,
           });
-          await ensureActive([item.page.url], [{ id, url: item.page.url }]);
+          await ensureActive(
+            [item.page.url, ...item.sourceUrls],
+            [{ id, url: item.page.url, documentEpoch: item.documentEpoch }],
+          );
           return send(
             200,
             capResponse(
@@ -1095,13 +1360,13 @@ function createHelperServer(options: HelperServerOptions): http.Server {
                 ok: true,
                 text: capText(
                   text,
-                  maxChars,
+                  textCap,
                   findCommand(id, query, maxChars, commandBrowser),
                   'next',
                 ).text,
                 data: { matches },
               },
-              maxChars,
+              responseCap(body),
             ),
           );
         }
@@ -1117,25 +1382,81 @@ function createHelperServer(options: HelperServerOptions): http.Server {
           const html = optionalBoolean(body.html, 'html') || false;
           const limit = integerParam(body.limit, 'limit', 20, 1, 100);
           const maxChars = maxCharsFor(body.maxChars);
-          const tab = (await router.request('tab', { id })) as TabInfo;
-          const result = await router.request(
+          const textCap = responseTextCap(body);
+          const offset = integerParam(body.offset, 'offset', 0, 0);
+          const tab = (await extensionRequest('tab', { id })) as TabInfo;
+          const result = await extensionRequest(
             'query',
             {
               id,
               selector,
               html,
               limit,
+              offset,
             },
             20_000,
           );
           assertRequestActive();
           const values = Array.isArray(result?.values)
             ? result.values.map((value: unknown) => redactEmbeddedUrls(pdfSafeText(String(value))))
-            : [];
-          const text = values.length
-            ? values.map((value: string, index: number) => `${index + 1}. ${value}`).join('\n\n')
-            : 'No elements matched the selector.';
-          await ensureActive([result?.url || tab.url], [{ id, url: result?.url || tab.url }]);
+            : undefined;
+          const output =
+            typeof result?.text === 'string'
+              ? result.text
+              : values
+                  ?.map((value: string, index: number) => `${index + 1}. ${value}`)
+                  .join('\n\n') || '';
+          const hasMore = result?.hasMore === true;
+          let text =
+            output || (offset ? 'No more query text.' : 'No elements matched the selector.');
+          let nextOffset: number | undefined;
+          if (hasMore || jsonTextSize(text) > textCap) {
+            const reserve = queryCommand(
+              id,
+              selector,
+              { ...body, html, offset: Number.MAX_SAFE_INTEGER },
+              maxChars,
+              commandBrowser,
+            );
+            const budget = textCap - jsonTextSize(`\n\nnext: ${reserve}`);
+            const fragment = capText(output, Math.max(0, budget)).text;
+            if (fragment) {
+              nextOffset = offset + fragment.length;
+              text = withNext(
+                fragment,
+                queryCommand(
+                  id,
+                  selector,
+                  { ...body, html, offset: nextOffset },
+                  maxChars,
+                  commandBrowser,
+                ),
+                textCap,
+              );
+            } else {
+              text = withNext(
+                '',
+                queryCommand(
+                  id,
+                  selector,
+                  { ...body, html, offset },
+                  continuationMaxChars(maxChars),
+                  commandBrowser,
+                ),
+                textCap,
+              );
+            }
+          }
+          await ensureActive(
+            [result?.url || tab.url],
+            [
+              {
+                id,
+                url: result?.url || tab.url,
+                documentEpoch: requireDocumentEpoch(result.documentEpoch),
+              },
+            ],
+          );
           await recordRead({
             time: new Date().toISOString(),
             browser,
@@ -1145,28 +1466,41 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             url: safeUrl(result?.url || tab.url),
             chars: text.length,
           });
-          await ensureActive([result?.url || tab.url], [{ id, url: result?.url || tab.url }]);
+          await ensureActive(
+            [result?.url || tab.url],
+            [
+              {
+                id,
+                url: result?.url || tab.url,
+                documentEpoch: requireDocumentEpoch(result.documentEpoch),
+              },
+            ],
+          );
           return send(
             200,
             capResponse(
               {
                 ok: true,
-                text: capText(
-                  text,
-                  maxChars,
-                  queryCommand(id, selector, { ...body, html }, maxChars, commandBrowser),
-                  'next',
-                ).text,
-                data: { values },
+                text,
+                data: {
+                  values: nextOffset === undefined && !hasMore ? values : undefined,
+                  offset,
+                  nextOffset,
+                },
               },
-              maxChars,
+              responseCap(body),
             ),
           );
         }
         if (command === 'selection') {
           const id = body.id === undefined ? undefined : numericParam(body.id, 'tab id');
           const maxChars = maxCharsFor(body.maxChars);
-          const result = await router.request('selection', id === undefined ? {} : { id }, 20_000);
+          const textCap = responseTextCap(body);
+          const result = await extensionRequest(
+            'selection',
+            id === undefined ? {} : { id },
+            20_000,
+          );
           assertRequestActive();
           const text = redactEmbeddedUrls(
             pdfSafeText(typeof result.text === 'string' ? result.text : '(no text is selected)'),
@@ -1181,7 +1515,15 @@ function createHelperServer(options: HelperServerOptions): http.Server {
           };
           await ensureActive(
             [result.url],
-            safeResult.tabId === undefined ? [] : [{ id: safeResult.tabId, url: result.url }],
+            safeResult.tabId === undefined
+              ? []
+              : [
+                  {
+                    id: safeResult.tabId,
+                    url: result.url,
+                    documentEpoch: requireDocumentEpoch(result.documentEpoch),
+                  },
+                ],
           );
           await recordRead({
             time: new Date().toISOString(),
@@ -1194,7 +1536,15 @@ function createHelperServer(options: HelperServerOptions): http.Server {
           });
           await ensureActive(
             [result.url],
-            safeResult.tabId === undefined ? [] : [{ id: safeResult.tabId, url: result.url }],
+            safeResult.tabId === undefined
+              ? []
+              : [
+                  {
+                    id: safeResult.tabId,
+                    url: result.url,
+                    documentEpoch: requireDocumentEpoch(result.documentEpoch),
+                  },
+                ],
           );
           return send(
             200,
@@ -1203,20 +1553,20 @@ function createHelperServer(options: HelperServerOptions): http.Server {
                 ok: true,
                 text: capText(
                   text,
-                  maxChars,
+                  textCap,
                   selectionCommand(safeResult.tabId, maxChars, commandBrowser),
                   'next',
                 ).text,
                 data: safeResult,
               },
-              maxChars,
+              responseCap(body),
             ),
           );
         }
         if (command === 'screenshot') {
           const windowId =
             body.windowId === undefined ? undefined : numericParam(body.windowId, 'window id');
-          const result = await router.request(
+          const result = await extensionRequest(
             'screenshot',
             windowId === undefined ? {} : { windowId },
             20_000,
@@ -1249,7 +1599,15 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             );
           await ensureActive(
             [result.url],
-            safeResult.tabId === undefined ? [] : [{ id: safeResult.tabId, url: result.url }],
+            safeResult.tabId === undefined
+              ? []
+              : [
+                  {
+                    id: safeResult.tabId,
+                    url: result.url,
+                    documentEpoch: requireDocumentEpoch(result.documentEpoch),
+                  },
+                ],
           );
           await recordRead({
             time: new Date().toISOString(),
@@ -1262,14 +1620,23 @@ function createHelperServer(options: HelperServerOptions): http.Server {
           });
           await ensureActive(
             [result.url],
-            safeResult.tabId === undefined ? [] : [{ id: safeResult.tabId, url: result.url }],
+            safeResult.tabId === undefined
+              ? []
+              : [
+                  {
+                    id: safeResult.tabId,
+                    url: result.url,
+                    documentEpoch: requireDocumentEpoch(result.documentEpoch),
+                  },
+                ],
           );
           return send(200, payload);
         }
         if (command === 'log') {
           const limit = integerParam(body.limit, 'limit', 20, 1, 200);
           const maxChars = maxCharsFor(body.maxChars);
-          await router.request('tabs', {});
+          const textCap = responseTextCap(body);
+          await extensionRequest('tabs', {});
           assertRequestActive();
           let entries: Record<string, unknown>[] = [];
           for (const file of [readsLog, `${readsLog}.1`]) {
@@ -1305,11 +1672,11 @@ function createHelperServer(options: HelperServerOptions): http.Server {
             capResponse(
               {
                 ok: true,
-                text: capText(text, maxChars, logCommand(limit, maxChars, commandBrowser), 'next')
+                text: capText(text, textCap, logCommand(limit, maxChars, commandBrowser), 'next')
                   .text,
                 data: entries,
               },
-              maxChars,
+              responseCap(body),
             ),
           );
         }
@@ -1319,7 +1686,7 @@ function createHelperServer(options: HelperServerOptions): http.Server {
         const message = oneLine(error?.message || 'The cobrowser request failed.', 500);
         let maxChars = MAX_CHARS;
         try {
-          maxChars = maxCharsFor(body.maxChars);
+          maxChars = responseCap(body);
         } catch {
           /* Keep the full useful error when the requested cap is itself invalid. */
         }
@@ -1338,15 +1705,32 @@ function createHelperServer(options: HelperServerOptions): http.Server {
     logger.write(`socket error: ${error instanceof Error ? error.message : String(error)}`);
     void stop(1);
   });
-  server.listen(socketPath, () => {
-    try {
-      fs.chmodSync(socketPath, 0o600);
-    } catch {
-      /* best effort on platforms without chmod */
-    }
-    logger.write(`listening on ${socketPath}`);
-  });
   return server;
+}
+
+interface SocketIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
+function socketIdentity(socketPath: string): SocketIdentity | undefined {
+  try {
+    const stat = fs.lstatSync(socketPath, { bigint: true });
+    return stat.isSocket() ? { dev: stat.dev, ino: stat.ino } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function unlinkOwnedSocket(socketPath: string, owned: SocketIdentity | undefined) {
+  if (!owned) return;
+  const current = socketIdentity(socketPath);
+  if (current?.dev !== owned.dev || current.ino !== owned.ino) return;
+  try {
+    fs.unlinkSync(socketPath);
+  } catch {
+    /* Another helper may have already removed the socket. */
+  }
 }
 
 async function run() {
@@ -1363,6 +1747,7 @@ async function run() {
       'The cobrowser home path is too long for a Unix socket. Set COBROWSER_HOME to a shorter path and try again.',
     );
   if (fs.existsSync(socketPath)) {
+    const staleSocket = socketIdentity(socketPath);
     const alive = await new Promise<boolean>((resolve) => {
       const socket = net.createConnection(socketPath);
       let settled = false;
@@ -1382,9 +1767,12 @@ async function run() {
       logger.write('another helper is running');
       return;
     }
-    await fsp.unlink(socketPath).catch(() => undefined);
+    unlinkOwnedSocket(socketPath, staleSocket);
   }
-  const router = new ExtensionRouter(extensionDiskVersion(home));
+  const router = new ExtensionRouter(
+    extensionDiskVersion(home),
+    extensionBuildRevision(path.join(home, 'extension')),
+  );
   const cache = new Map<string, CacheEntry>();
   const pendingReads = new Map<string, PendingRead>();
   const invalidatedReads = new WeakSet<object>();
@@ -1405,6 +1793,7 @@ async function run() {
     }
   };
   let server: http.Server | undefined;
+  let ownedSocket: SocketIdentity | undefined;
   let stopping = false;
   const readsLog = path.join(home, 'logs', 'reads.jsonl');
   let readLogQueue: Promise<void> = Promise.resolve();
@@ -1444,8 +1833,8 @@ async function run() {
     if (stopping) return;
     stopping = true;
     logger.write('helper shutting down');
-    server?.close();
-    await fsp.unlink(socketPath).catch(() => undefined);
+    // Closing a Unix listener also unlinks its path, which may belong to a newer helper.
+    unlinkOwnedSocket(socketPath, ownedSocket);
     process.exit(exitCode);
   };
   process.once('SIGINT', () => void stop(130));
@@ -1486,6 +1875,15 @@ async function run() {
     appendLog,
     recordRead,
     stop,
+  });
+  server.listen(socketPath, () => {
+    ownedSocket = socketIdentity(socketPath);
+    try {
+      fs.chmodSync(socketPath, 0o600);
+    } catch {
+      /* best effort on platforms without chmod */
+    }
+    logger.write(`listening on ${socketPath}`);
   });
   process.stdin.on('end', () => void stop());
   process.stdin.on('close', () => void stop());

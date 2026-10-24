@@ -59,6 +59,16 @@ export function normalizeDenylist(value: unknown): string[] {
   return value.length > 0 && patterns.length === 0 ? DEFAULT_DENYLIST : patterns;
 }
 
+function comparablePath(path: string): string {
+  // A malformed suffix must not prevent a valid escaped prefix from matching.
+  path = path.replace(/(?:%[0-9a-f]{2})+/gi, (escaped) =>
+    new TextDecoder('utf-8', { ignoreBOM: true }).decode(
+      Uint8Array.from(escaped.match(/%[0-9a-f]{2}/gi)!, (byte) => parseInt(byte.slice(1), 16)),
+    ),
+  );
+  return path.replace(/\/+$/, '').toLowerCase();
+}
+
 export function matchesDenylist(url: string, patterns: string[]): boolean {
   let parsed: URL;
   try {
@@ -67,20 +77,14 @@ export function matchesDenylist(url: string, patterns: string[]): boolean {
     return false;
   }
   const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
-  let path = parsed.pathname;
-  try {
-    path = decodeURIComponent(path);
-  } catch {
-    /* Keep the encoded path when a page contains malformed escaping. */
-  }
-  path = path.replace(/\/+$/, '').toLowerCase();
+  const path = comparablePath(parsed.pathname);
   return patterns.some((raw) => {
     if (typeof raw !== 'string') return false;
     const pattern = normalizeDenylistPattern(raw);
     if (!pattern) return false;
     const slash = pattern.indexOf('/');
     const patternHost = (slash < 0 ? pattern : pattern.slice(0, slash)).replace(/\.+$/, '');
-    const patternPath = slash < 0 ? '' : pattern.slice(slash);
+    const patternPath = slash < 0 ? '' : comparablePath(pattern.slice(slash));
     const hostMatch = host === patternHost || host.endsWith(`.${patternHost}`);
     return (
       hostMatch && (!patternPath || path === patternPath || path.startsWith(`${patternPath}/`))

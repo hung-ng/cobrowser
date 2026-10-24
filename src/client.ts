@@ -20,6 +20,17 @@ export interface ClientResponse {
   error?: { code: string; message: string };
 }
 
+export interface ClientRequestOptions {
+  signal?: AbortSignal;
+}
+
+function cancelledRequest(): Error {
+  return Object.assign(new Error('The request was cancelled.'), {
+    name: 'AbortError',
+    code: 'CANCELLED',
+  });
+}
+
 const SIMPLE_NAME = /^[a-z0-9][a-z0-9._-]*$/i;
 const MAX_CLIENT_REQUEST_BYTES = 1_000_000;
 const MAX_CLIENT_RESPONSE_BYTES = 80 * 1024 * 1024;
@@ -54,6 +65,7 @@ export function readResponseBody(
     const finish = (error?: Error, body?: Buffer) => {
       if (settled) return;
       settled = true;
+      chunks.length = 0;
       if (error) reject(error);
       else resolve(body || Buffer.alloc(0));
     };
@@ -73,16 +85,16 @@ export function readResponseBody(
       Array.isArray(declaredHeader) ? declaredHeader[0] : declaredHeader,
     );
     if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-      response.resume();
       finish(tooLarge);
+      response.destroy();
       return;
     }
     response.on('data', (chunk) => {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       size += bytes.length;
       if (size > maxBytes) {
-        response.resume();
         finish(tooLarge);
+        response.destroy();
         return;
       }
       chunks.push(bytes);
@@ -115,7 +127,8 @@ function cleanAgent(value: unknown): string {
       .replace(/[\u0000-\u001f\u007f]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 120) || 'cli'
+      .slice(0, 120)
+      .replace(/[\ud800-\udfff]/gu, '') || 'cli'
   );
 }
 
@@ -322,11 +335,18 @@ export class CobrowserClient {
       );
     return socketPath;
   }
-  async request(command: string, body: Record<string, unknown> = {}): Promise<ClientResponse> {
+  async request(
+    command: string,
+    body: Record<string, unknown> = {},
+    options: ClientRequestOptions = {},
+  ): Promise<ClientResponse> {
+    const signal = options.signal;
+    if (signal?.aborted) throw cancelledRequest();
     if (!/^[a-z][a-z0-9-]*$/i.test(command))
       throw Object.assign(new Error('Use a supported cobrowser command.'), { code: 'BAD_REQUEST' });
     const serializedBody = serializeClientRequest(body);
     const socketPath = await this.socketPath();
+    if (signal?.aborted) throw cancelledRequest();
     return new Promise((resolve, reject) => {
       let connectTimer: NodeJS.Timeout | undefined;
       let responseTimer: NodeJS.Timeout | undefined;
@@ -348,17 +368,21 @@ export class CobrowserClient {
           socketPath,
           path: `/v1/${command}`,
           method: 'POST',
+          signal,
           headers: {
             'content-type': 'application/json',
             'content-length': Buffer.byteLength(serializedBody),
-            'x-cobrowser-agent': this.agent,
+            'x-cobrowser-agent': encodeURIComponent(this.agent),
           },
         },
         (response) => {
           void readResponseBody(response).then(
             (body) => {
-              if (responseTimer) clearTimeout(responseTimer);
-              responseTimer = undefined;
+              clearTimers();
+              if (signal?.aborted) {
+                reject(cancelledRequest());
+                return;
+              }
               try {
                 resolve(parseClientResponse(JSON.parse(body.toString('utf8'))));
               } catch {
@@ -375,9 +399,8 @@ export class CobrowserClient {
               }
             },
             (error) => {
-              if (responseTimer) clearTimeout(responseTimer);
-              responseTimer = undefined;
-              reject(error);
+              clearTimers();
+              reject(signal?.aborted ? cancelledRequest() : error);
             },
           );
         },
@@ -399,14 +422,15 @@ export class CobrowserClient {
             request.destroy(timeoutError());
           });
         };
-        socket.once('connect', connectedOnce);
-        socket.once('error', () => {
-          if (connectTimer) clearTimeout(connectTimer);
-          connectTimer = undefined;
-        });
+        if (socket.connecting) socket.once('connect', connectedOnce);
+        else connectedOnce();
       });
       request.on('error', (error: any) => {
         clearTimers();
+        if (signal?.aborted) {
+          reject(cancelledRequest());
+          return;
+        }
         const code =
           error.code === 'TIMEOUT' || error.code === 'ETIMEDOUT' ? 'TIMEOUT' : 'BROWSER_OFFLINE';
         const message =
