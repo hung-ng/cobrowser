@@ -1,5 +1,6 @@
 import { DEFAULT_DENYLIST, matchesDenylist, normalizeDenylist } from '../shared/denylist.js';
 import {
+  EXTENSION_REVISION,
   MAX_GUARD_URL_CHARS,
   NATIVE_HOST,
   normalizeErrorCode,
@@ -271,10 +272,30 @@ async function connect() {
         }
         const data = (
           message as {
-            data?: { protocol?: number; version?: string; extensionVersion?: unknown };
+            data?: {
+              protocol?: number;
+              version?: string;
+              extensionVersion?: unknown;
+              extensionRevision?: unknown;
+            };
           }
         ).data;
-        if (typeof data?.extensionVersion === 'string' && data.extensionVersion !== VERSION) {
+        if (
+          data?.extensionRevision !== undefined &&
+          (typeof data.extensionRevision !== 'string' ||
+            !/^[a-f0-9]{64}$/.test(data.extensionRevision))
+        ) {
+          disconnectForProtocol(
+            port,
+            'The helper returned invalid build details; run cobrowser setup and retry.',
+          );
+          return;
+        }
+        if (
+          (typeof data?.extensionVersion === 'string' && data.extensionVersion !== VERSION) ||
+          (typeof data?.extensionRevision === 'string' &&
+            data.extensionRevision !== EXTENSION_REVISION)
+        ) {
           chrome.runtime.reload();
         } else if (data?.protocol !== PROTOCOL_VERSION || data.version !== VERSION) {
           disconnectForProtocol(
@@ -329,7 +350,10 @@ async function connect() {
       handshakePending = false;
       scheduleReconnect();
     });
-    send({ event: 'hello', data: { version: VERSION, protocol: PROTOCOL_VERSION } });
+    send({
+      event: 'hello',
+      data: { version: VERSION, protocol: PROTOCOL_VERSION, extensionRevision: EXTENSION_REVISION },
+    });
   } catch (error) {
     await setConnectionState(false, error instanceof Error ? error.message : String(error));
     scheduleReconnect();

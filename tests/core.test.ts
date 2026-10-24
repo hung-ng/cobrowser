@@ -44,6 +44,7 @@ import {
   isNativeHostManifest,
   isLauncherScript,
   launcherScript,
+  launcherNodePath,
   nativeHostManifest,
 } from '../src/setup.js';
 import { normalizeErrorCode, VERSION } from '../src/shared/constants.js';
@@ -763,6 +764,14 @@ describe('search and special documents', () => {
 });
 
 describe('setup files', () => {
+  it('recovers an absolute Node path with spaces and quotes from a managed launcher', () => {
+    const runtime = '/tmp/cobrowser/runtime/0.1.0';
+    const nodePath = "/tmp/Node versions/it's node";
+    expect(launcherNodePath(launcherScript(runtime, 'arc', nodePath), runtime, 'arc')).toBe(
+      nodePath,
+    );
+    expect(isLauncherScript(launcherScript(runtime, 'arc', 'node'), runtime, 'arc')).toBe(false);
+  });
   it('accepts custom browser names without path separators', () => {
     expect(isSimpleBrowserName('opera')).toBe(true);
     expect(isSimpleBrowserName('my.browser-1')).toBe(true);

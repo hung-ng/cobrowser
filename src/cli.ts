@@ -253,23 +253,11 @@ async function main() {
       throw Object.assign(new Error('Use --native-hosts-dir with one browser.'), {
         code: 'BAD_REQUEST',
       });
-    const unsupported = requestedNames.filter(
-      (name) => !(SUPPORTED_BROWSERS as readonly string[]).includes(name),
-    );
-    if (unsupported.length && !nativeHostsDir)
-      throw Object.assign(new Error(`Unsupported browser: ${unsupported.join(', ')}.`), {
-        code: 'BAD_REQUEST',
-      });
-    const browsers = nativeHostsDir
-      ? requestedNames
-      : requestedNames.filter((name): name is SupportedBrowser =>
-          (SUPPORTED_BROWSERS as readonly string[]).includes(name),
-        );
-    if (!browsers.length)
+    if (!requestedNames.length)
       throw Object.assign(new Error(`Use a supported browser: ${SUPPORTED_BROWSERS.join(', ')}.`), {
         code: 'BAD_REQUEST',
       });
-    const lines = await setup(browsers, { nativeHostsDir });
+    const lines = await setup(requestedNames, { nativeHostsDir });
     if (json) {
       const output = boundedJson({ ok: true, lines }, maxCharsValue ?? MAX_CHARS);
       process.stdout.write(output.length < (maxCharsValue ?? MAX_CHARS) ? `${output}\n` : output);

@@ -1,6 +1,9 @@
 declare const COBROWSER_VERSION: string | undefined;
+declare const COBROWSER_EXTENSION_REVISION: string | undefined;
 
 export const VERSION = typeof COBROWSER_VERSION === 'string' ? COBROWSER_VERSION : '0.1.0';
+export const EXTENSION_REVISION =
+  typeof COBROWSER_EXTENSION_REVISION === 'string' ? COBROWSER_EXTENSION_REVISION : undefined;
 export const PROTOCOL_VERSION = 1;
 export const MAX_CHARS = 20_000;
 /** Keep screenshot transport payloads bounded while allowing the CLI to save images. */

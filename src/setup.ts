@@ -5,11 +5,17 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
+import {
+  inspectAgentRegistration,
+  updateAgentRegistration,
+  type AgentCommand,
+} from './agent-registration.js';
 import { readResponseBody } from './client.js';
+import { InstallTransaction, physicalPath } from './install-transaction.js';
+import { SETUP_LOCK_NAME, withSetupLock } from './setup-lock.js';
 import { EXTENSION_ID, PROTOCOL_VERSION, PUBLIC_KEY, VERSION } from './shared/constants.js';
+import { extensionBuildRevision } from './shared/extension-build.js';
 
-const exec = promisify(execFile);
 const SKILL_MARKER = '.cobrowser-managed';
 const SKILL_MARKER_CONTENT = 'cobrowser\n';
 export const SUPPORTED_BROWSERS = [
@@ -209,21 +215,12 @@ function nativeHostRecords(root: string): NativeHostRecord[] {
   return [...records.values()];
 }
 
-async function writeNativeHostConfig(
-  root: string,
-  records: NativeHostRecord[],
-  configuredBrowsers: Set<string>,
-) {
-  const file = setupConfigPath(root);
-  await writeFileAtomic(
-    file,
-    `${JSON.stringify(
-      { version: 1, nativeHosts: records, configuredBrowsers: [...configuredBrowsers].sort() },
-      null,
-      2,
-    )}\n`,
-    0o600,
-  );
+function nativeHostConfig(records: NativeHostRecord[], configuredBrowsers: Set<string>): string {
+  return `${JSON.stringify(
+    { version: 1, nativeHosts: records, configuredBrowsers: [...configuredBrowsers].sort() },
+    null,
+    2,
+  )}\n`;
 }
 
 function commandExists(names: string[]): boolean {
@@ -250,22 +247,33 @@ export function launcherScript(
   return `#!/bin/sh\nexport COBROWSER_HOME=${shellQuote(root)}\nexec ${shellQuote(nodePath)} ${shellQuote(path.join(runtime, 'helper.js'))} --browser ${shellQuote(browser)}\n`;
 }
 
-export function isLauncherScript(value: unknown, runtime: string, browser: string): boolean {
-  if (typeof value !== 'string') return false;
+export function launcherNodePath(
+  value: unknown,
+  runtime: string,
+  browser: string,
+): string | undefined {
+  if (typeof value !== 'string') return undefined;
   const root = path.dirname(path.dirname(runtime));
   const helper = `${shellQuote(path.join(runtime, 'helper.js'))} --browser ${shellQuote(browser)}`;
   const lines = value.split('\n');
-  if (lines.length !== 4 || lines[3] !== '') return false;
+  if (lines.length !== 4 || lines[3] !== '') return undefined;
   const execLine = lines[2];
   const prefix = 'exec ';
   const suffix = ` ${helper}`;
-  if (!execLine.startsWith(prefix) || !execLine.endsWith(suffix)) return false;
+  if (!execLine.startsWith(prefix) || !execLine.endsWith(suffix)) return undefined;
   const nodePath = execLine.slice(prefix.length, execLine.length - suffix.length);
-  return (
-    lines[0] === '#!/bin/sh' &&
-    lines[1] === `export COBROWSER_HOME=${shellQuote(root)}` &&
-    /^'(?:[^']|'\\'')+'$/.test(nodePath)
-  );
+  if (
+    lines[0] !== '#!/bin/sh' ||
+    lines[1] !== `export COBROWSER_HOME=${shellQuote(root)}` ||
+    !/^'(?:[^']|'\\'')+'$/.test(nodePath)
+  )
+    return undefined;
+  const decoded = nodePath.slice(1, -1).replaceAll("'\\''", "'");
+  return path.isAbsolute(decoded) ? decoded : undefined;
+}
+
+export function isLauncherScript(value: unknown, runtime: string, browser: string): boolean {
+  return launcherNodePath(value, runtime, browser) !== undefined;
 }
 
 export function nativeHostManifest(launcher: string) {
@@ -299,6 +307,135 @@ function sourceDist(): string {
   return path.dirname(fileURLToPath(import.meta.url));
 }
 
+async function validateBuildFiles(directory: string, files: string[]): Promise<void> {
+  for (const file of files) {
+    const target = path.join(directory, file);
+    try {
+      const stat = await fsp.stat(target);
+      if (!stat.isFile() || stat.size === 0) throw new Error('Missing build asset.');
+    } catch {
+      throw new Error(
+        `The cobrowser build is missing ${file}; reinstall cobrowser and run setup again.`,
+      );
+    }
+    try {
+      await fsp.access(target, fs.constants.R_OK);
+    } catch {
+      throw new Error(
+        `The cobrowser build cannot read ${file}; check its permissions and run setup again.`,
+      );
+    }
+  }
+}
+
+async function validateSourceBuild(directory: string): Promise<void> {
+  await validateBuildFiles(directory, ['cli.js', 'client.js', 'helper.js']);
+  await validateExtensionBuild(path.join(directory, 'extension'));
+}
+
+function validExtensionManifest(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const manifest = value as Record<string, any>;
+  const permissions = ['tabs', 'scripting', 'nativeMessaging', 'storage', 'alarms', 'webRequest'];
+  const sameStrings = (values: unknown, expected: string[]) =>
+    Array.isArray(values) &&
+    values.length === expected.length &&
+    new Set(values).size === values.length &&
+    values.every((item) => typeof item === 'string' && expected.includes(item));
+  return (
+    manifest.manifest_version === 3 &&
+    manifest.name === 'cobrowser' &&
+    manifest.version === VERSION &&
+    manifest.key === PUBLIC_KEY &&
+    manifest.incognito === 'not_allowed' &&
+    sameStrings(manifest.permissions, permissions) &&
+    sameStrings(manifest.host_permissions, ['<all_urls>']) &&
+    (manifest.optional_permissions === undefined ||
+      sameStrings(manifest.optional_permissions, [])) &&
+    (manifest.optional_host_permissions === undefined ||
+      sameStrings(manifest.optional_host_permissions, [])) &&
+    manifest.background?.service_worker === 'service-worker.js' &&
+    Object.keys(manifest.background).every((key) => key === 'service_worker') &&
+    manifest.action?.default_popup === 'popup.html' &&
+    manifest.options_page === 'options.html'
+  );
+}
+
+async function validateExtensionBuild(directory: string): Promise<void> {
+  await validateBuildFiles(directory, [
+    'manifest.json',
+    'service-worker.js',
+    'popup.html',
+    'popup.js',
+    'options.html',
+    'options.js',
+  ]);
+  try {
+    const manifest = JSON.parse(await fsp.readFile(path.join(directory, 'manifest.json'), 'utf8'));
+    if (!validExtensionManifest(manifest)) throw new Error('Invalid extension build.');
+  } catch {
+    throw new Error(
+      'The cobrowser extension build is invalid; reinstall cobrowser and run setup again.',
+    );
+  }
+}
+
+async function sameDirectoryFiles(first: string, second: string): Promise<boolean> {
+  try {
+    const previous = await fsp.readdir(first, { withFileTypes: true });
+    const current = await fsp.readdir(second, { withFileTypes: true });
+    if (previous.length !== current.length) return false;
+    const entries = new Map(previous.map((entry) => [entry.name, entry]));
+    for (const entry of current) {
+      const existing = entries.get(entry.name);
+      if (!existing) return false;
+      const left = path.join(first, entry.name);
+      const right = path.join(second, entry.name);
+      if (entry.isDirectory() && existing.isDirectory()) {
+        if (!(await sameDirectoryFiles(left, right))) return false;
+      } else if (entry.isFile() && existing.isFile()) {
+        if (!(await fsp.readFile(left)).equals(await fsp.readFile(right))) return false;
+      } else return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function validateNativeHostDirectories(
+  root: string,
+  records: NativeHostRecord[],
+): Promise<void> {
+  const directories = new Map<string, string>();
+  const lock = path.join(await physicalPath(root), SETUP_LOCK_NAME);
+  for (const { browser, directory } of records) {
+    let physical: string;
+    try {
+      const existing = await fsp.stat(directory).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error;
+        return undefined;
+      });
+      if (existing && !existing.isDirectory()) throw new Error('Not a directory.');
+      physical = await physicalPath(directory);
+    } catch {
+      throw new Error(
+        `Could not prepare the ${browser} native-host directory at ${directory}; choose a writable directory and run setup again.`,
+      );
+    }
+    if (physical === lock || physical.startsWith(`${lock}${path.sep}`))
+      throw new Error(
+        `The ${browser} native-host directory overlaps the setup lock; choose a directory outside ${lock} and run setup again.`,
+      );
+    const otherBrowser = directories.get(physical);
+    if (otherBrowser)
+      throw new Error(
+        `The ${browser} and ${otherBrowser} native-host directories are the same; choose a separate directory for each browser and run setup again.`,
+      );
+    directories.set(physical, browser);
+  }
+}
+
 export async function setup(
   browsers: string[],
   options: { nativeHostsDir?: string } = {},
@@ -309,17 +446,39 @@ export async function setup(
   if (invalid.length) throw new Error(`Use simple browser names: ${invalid.join(', ')}.`);
   if (options.nativeHostsDir && browsers.length !== 1)
     throw new Error('Use --native-hosts-dir with one browser.');
-  const unsupported = browsers.filter(
-    (browser) => !(SUPPORTED_BROWSERS as readonly string[]).includes(browser),
-  );
+  const root = home();
+  return withSetupLock(root, () => installSetup(root, browsers, options));
+}
+
+async function installSetup(
+  root: string,
+  browsers: string[],
+  options: { nativeHostsDir?: string },
+): Promise<string[]> {
+  const savedHosts = nativeHostRecords(root);
+  const directories = new Map(savedHosts.map((record) => [record.browser, record.directory]));
+  const unsupported = browsers.filter((browser) => !directories.has(browser));
   if (unsupported.length && !options.nativeHostsDir)
-    throw new Error(`Unsupported browser: ${unsupported.join(', ')}.`);
+    throw Object.assign(
+      new Error(`Use --native-hosts-dir to configure ${unsupported.join(', ')}.`),
+      { code: 'BAD_REQUEST' },
+    );
   if (process.platform !== 'darwin' && browsers.includes('arc'))
     throw new Error('Arc setup is supported only on macOS.');
   const nativeHostsDir = options.nativeHostsDir ? path.resolve(options.nativeHostsDir) : undefined;
-  const root = home();
+  const requestedBrowsers = new Set(browsers);
   const configuredBrowsers = configuredNativeHostBrowsers(root);
   for (const browser of browsers) configuredBrowsers.add(browser);
+  // All configured browsers load the same extension folder, so their helpers must upgrade together.
+  browsers = [
+    ...new Set(
+      [...browsers, ...configuredBrowsers].filter(
+        (browser) =>
+          (requestedBrowsers.has(browser) || directories.has(browser)) &&
+          (browser !== 'arc' || process.platform === 'darwin'),
+      ),
+    ),
+  ];
   const longSocket = browsers.find(
     (browser) => Buffer.byteLength(path.join(root, 'run', `${browser}.sock`), 'utf8') >= 104,
   );
@@ -329,87 +488,103 @@ export async function setup(
     );
   const runtimeRoot = path.join(root, 'runtime');
   const runtime = path.join(runtimeRoot, VERSION);
-  const runtimeStaging = path.join(runtimeRoot, `.staging-${VERSION}-${process.pid}`);
-  await fsp.mkdir(runtimeRoot, { recursive: true, mode: 0o700 });
-  await fsp.rm(runtimeStaging, { recursive: true, force: true });
-  try {
-    await fsp.cp(sourceDist(), runtimeStaging, { recursive: true, force: true });
-    const sourceSkills = path.join(sourceDist(), '..', 'skills');
-    if (fs.existsSync(sourceSkills))
-      await fsp.cp(sourceSkills, path.join(runtimeStaging, 'skills'), {
-        recursive: true,
-        force: true,
-      });
-    await replaceDirectory(runtimeStaging, runtime);
-  } finally {
-    await fsp.rm(runtimeStaging, { recursive: true, force: true });
-  }
   const extension = path.join(root, 'extension');
-  const extensionStaging = path.join(root, `.extension-staging-${VERSION}-${process.pid}`);
-  await fsp.rm(extensionStaging, { recursive: true, force: true });
-  try {
-    await fsp.cp(path.join(runtime, 'extension'), extensionStaging, {
-      recursive: true,
-      force: true,
-    });
-    await replaceDirectory(extensionStaging, extension);
-  } finally {
-    await fsp.rm(extensionStaging, { recursive: true, force: true });
-  }
-  await fsp.chmod(root, 0o700).catch(() => undefined);
-  const messages: string[] = [`runtime installed at ${runtime}`];
-  await installSkill(messages);
   const nativeHosts = browsers.map((browser) => ({
     browser,
     directory:
-      nativeHostsDir ??
-      ((SUPPORTED_BROWSERS as readonly string[]).includes(browser)
-        ? browserHostDirectory(browser as SupportedBrowser)
-        : ''),
+      nativeHostsDir && requestedBrowsers.has(browser) ? nativeHostsDir : directories.get(browser)!,
   }));
-  for (const browser of browsers) {
-    const hosts = path.join(root, 'hosts');
-    const launcher = path.join(hosts, browser);
-    await fsp.mkdir(hosts, { recursive: true, mode: 0o700 });
-    await writeFileAtomic(launcher, launcherScript(runtime, browser), 0o755);
-    const directory = nativeHosts.find((entry) => entry.browser === browser)?.directory
-      ? nativeHosts.find((entry) => entry.browser === browser)!.directory
-      : (SUPPORTED_BROWSERS as readonly string[]).includes(browser)
-        ? browserHostDirectory(browser as SupportedBrowser)
-        : undefined;
-    if (!directory)
-      throw new Error(
-        `Unsupported browser ${browser}. Use --native-hosts-dir with a custom browser name.`,
-      );
+  await validateSourceBuild(sourceDist());
+  await validateNativeHostDirectories(root, nativeHosts);
+  const mergedNativeHosts = new Map(savedHosts.map((record) => [record.browser, record] as const));
+  for (const record of nativeHosts) mergedNativeHosts.set(record.browser, record);
+  const config = setupConfigPath(root);
+  const transaction = new InstallTransaction(root, [
+    { path: runtime, kind: 'directory' },
+    { path: extension, kind: 'directory' },
+    ...nativeHosts.flatMap(({ browser, directory }) => [
+      { path: path.join(root, 'hosts', browser), kind: 'file' as const },
+      { path: path.join(directory, 'cobrowser.json'), kind: 'file' as const },
+    ]),
+    { path: config, kind: 'file' },
+  ]);
+  const messages: string[] = [];
+  let reloadExtension = true;
+  try {
+    await transaction.prepare();
+    const runtimeStaging = transaction.staged(runtime);
     try {
-      await fsp.mkdir(directory, { recursive: true });
+      await fsp.cp(sourceDist(), runtimeStaging, { recursive: true, force: true });
       await writeFileAtomic(
-        path.join(directory, 'cobrowser.json'),
-        `${JSON.stringify(nativeHostManifest(launcher), null, 2)}\n`,
-        0o644,
+        path.join(runtimeStaging, 'package.json'),
+        `${JSON.stringify({ private: true, type: 'module', version: VERSION })}\n`,
+        0o600,
       );
-    } catch (error) {
+      const sourceSkills = path.join(sourceDist(), '..', 'skills');
+      if (fs.existsSync(sourceSkills))
+        await fsp.cp(sourceSkills, path.join(runtimeStaging, 'skills'), {
+          recursive: true,
+          force: true,
+        });
+      await fsp.cp(path.join(runtimeStaging, 'extension'), transaction.staged(extension), {
+        recursive: true,
+        force: true,
+      });
+      for (const { browser, directory } of nativeHosts) {
+        const launcher = path.join(root, 'hosts', browser);
+        await writeFileAtomic(
+          transaction.staged(launcher),
+          launcherScript(runtime, browser),
+          0o755,
+        );
+        await writeFileAtomic(
+          transaction.staged(path.join(directory, 'cobrowser.json')),
+          `${JSON.stringify(nativeHostManifest(launcher), null, 2)}\n`,
+          0o644,
+        );
+      }
+      await writeFileAtomic(
+        transaction.staged(config),
+        nativeHostConfig([...mergedNativeHosts.values()], configuredBrowsers),
+        0o600,
+      );
+    } catch {
       throw new Error(
-        `Could not install the ${browser} native host at ${directory}; check permissions and run setup again.`,
+        'Could not prepare the cobrowser installation; check the source build and directory permissions, then run setup again.',
       );
     }
-    messages.push(`${browser} native host installed`);
+    await validateSourceBuild(runtimeStaging);
+    await validateExtensionBuild(transaction.staged(extension));
+    await validateNativeHostDirectories(root, nativeHosts);
+    // A helper restart can keep open options and popup tabs when the worker files match.
+    reloadExtension = !(await sameDirectoryFiles(extension, transaction.staged(extension)));
+    await transaction.commit();
+  } finally {
+    messages.push(...(await transaction.cleanup()));
   }
-  const mergedNativeHosts = new Map(
-    nativeHostRecords(root).map((record) => [record.browser, record] as const),
-  );
-  for (const record of nativeHosts) mergedNativeHosts.set(record.browser, record);
-  await writeNativeHostConfig(root, [...mergedNativeHosts.values()], configuredBrowsers);
+  await fsp.chmod(root, 0o700).catch(() => undefined);
+  messages.unshift(`runtime installed at ${runtime}`);
+  await installSkill(messages);
+  for (const browser of browsers) messages.push(`${browser} native host installed`);
+  const revision = extensionBuildRevision(extension);
   for (const browser of browsers) {
-    if (await restartHelper(root, browser)) messages.push(`${browser} helper restart requested`);
+    const status = !reloadExtension && revision ? await helperStatus(root, browser) : undefined;
+    const needsReload =
+      reloadExtension || !status?.connected || status.extensionRevision !== revision;
+    if (await restartHelper(root, browser, needsReload))
+      messages.push(`${browser} helper restart requested`);
   }
-  await registerMcp('claude', runtime, 'claude mcp add --scope user cobrowser --', messages);
-  await registerMcp('codex', runtime, 'codex mcp add cobrowser --', messages);
+  await registerMcp('claude', runtime, messages);
+  await registerMcp('codex', runtime, messages);
   messages.push(
     `MCP config for other clients:\n${JSON.stringify(
       {
         mcpServers: {
-          cobrowser: { command: process.execPath, args: [path.join(runtime, 'cli.js'), 'mcp'] },
+          cobrowser: {
+            command: process.execPath,
+            args: [path.join(runtime, 'cli.js'), 'mcp'],
+            env: { COBROWSER_HOME: root },
+          },
         },
       },
       null,
@@ -432,7 +607,11 @@ async function copyToClipboard(value: string): Promise<boolean> {
   });
 }
 
-async function restartHelper(root: string, browser: string): Promise<boolean> {
+async function restartHelper(
+  root: string,
+  browser: string,
+  reloadExtension: boolean,
+): Promise<boolean> {
   const socketPath = path.join(root, 'run', `${browser}.sock`);
   if (!fs.existsSync(socketPath)) return false;
   return new Promise((resolve) => {
@@ -458,21 +637,36 @@ async function restartHelper(root: string, browser: string): Promise<boolean> {
       finish(false);
     }, 2_000);
     request.once('error', () => finish(false));
-    request.end('{}');
+    request.end(JSON.stringify({ reloadExtension }));
   });
 }
 
 async function helperStatus(
   root: string,
   browser: string,
-): Promise<{ connected: boolean; version?: string; protocol?: number } | undefined> {
+): Promise<
+  | {
+      connected: boolean;
+      version?: string;
+      protocol?: number;
+      extensionRevision?: string;
+    }
+  | undefined
+> {
   const socketPath = path.join(root, 'run', `${browser}.sock`);
   if (!fs.existsSync(socketPath)) return undefined;
   return new Promise((resolve) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const finish = (
-      value: { connected: boolean; version?: string; protocol?: number } | undefined,
+      value:
+        | {
+            connected: boolean;
+            version?: string;
+            protocol?: number;
+            extensionRevision?: string;
+          }
+        | undefined,
     ) => {
       if (settled) return;
       settled = true;
@@ -485,7 +679,12 @@ async function helperStatus(
           try {
             const parsed = JSON.parse(body.toString('utf8')) as {
               ok?: boolean;
-              data?: { connected?: boolean; version?: unknown; protocol?: unknown };
+              data?: {
+                connected?: boolean;
+                version?: unknown;
+                protocol?: unknown;
+                extensionRevision?: unknown;
+              };
             };
             finish(
               parsed.ok && parsed.data
@@ -497,6 +696,11 @@ async function helperStatus(
                       typeof parsed.data.protocol === 'number' &&
                       Number.isSafeInteger(parsed.data.protocol)
                         ? parsed.data.protocol
+                        : undefined,
+                    extensionRevision:
+                      typeof parsed.data.extensionRevision === 'string' &&
+                      /^[a-f0-9]{64}$/.test(parsed.data.extensionRevision)
+                        ? parsed.data.extensionRevision
                         : undefined,
                   }
                 : undefined,
@@ -585,20 +789,8 @@ async function installSkill(messages: string[]) {
   }
 }
 
-async function registerMcp(command: string, runtime: string, prefix: string, messages: string[]) {
-  try {
-    await exec(
-      'sh',
-      [
-        '-c',
-        `command -v ${command} >/dev/null 2>&1 && ${prefix} ${shellQuote(process.execPath)} ${shellQuote(path.join(runtime, 'cli.js'))} mcp`,
-      ],
-      { timeout: 10_000 },
-    );
-    messages.push(`${command} MCP registration updated`);
-  } catch {
-    /* Agent CLIs are optional. doctor explains how to add one later. */
-  }
+async function registerMcp(command: AgentCommand, runtime: string, messages: string[]) {
+  await updateAgentRegistration(command, runtime, messages);
 }
 
 export interface DoctorResult {
@@ -616,24 +808,15 @@ export async function doctor(): Promise<DoctorResult> {
   }
   const root = home();
   const runtime = path.join(root, 'runtime', VERSION);
-  const runtimeFiles = [
-    path.join(runtime, 'cli.js'),
-    path.join(runtime, 'client.js'),
-    path.join(runtime, 'helper.js'),
-    path.join(runtime, 'extension', 'manifest.json'),
-    path.join(runtime, 'extension', 'service-worker.js'),
-    path.join(runtime, 'extension', 'popup.html'),
-    path.join(runtime, 'extension', 'popup.js'),
-    path.join(runtime, 'extension', 'options.html'),
-    path.join(runtime, 'extension', 'options.js'),
-  ];
-  const runtimeReady = runtimeFiles.every((file) => {
-    try {
-      return fs.statSync(file).isFile();
-    } catch {
-      return false;
-    }
-  });
+  let runtimeReady = false;
+  try {
+    await validateBuildFiles(runtime, ['package.json']);
+    await validateSourceBuild(runtime);
+    const metadata = JSON.parse(fs.readFileSync(path.join(runtime, 'package.json'), 'utf8'));
+    runtimeReady = metadata?.type === 'module' && metadata.version === VERSION;
+  } catch {
+    runtimeReady = false;
+  }
   if (runtimeReady) lines.push(`ok runtime ${VERSION} is installed`);
   else {
     lines.push(`fix run cobrowser setup to install runtime ${VERSION}`);
@@ -659,11 +842,14 @@ export async function doctor(): Promise<DoctorResult> {
       const parsed = JSON.parse(fs.readFileSync(manifest, 'utf8')) as unknown;
       const launcherStat = fs.statSync(launcher);
       const launcherSource = fs.readFileSync(launcher, 'utf8');
+      const nodePath = launcherNodePath(launcherSource, runtime, browser);
+      if (nodePath) fs.accessSync(nodePath, fs.constants.X_OK);
       valid =
         isNativeHostManifest(parsed, launcher) &&
         launcherStat.isFile() &&
         (launcherStat.mode & 0o111) !== 0 &&
-        isLauncherScript(launcherSource, runtime, browser);
+        nodePath !== undefined &&
+        fs.statSync(nodePath).isFile();
     } catch {
       valid = false;
     }
@@ -677,24 +863,14 @@ export async function doctor(): Promise<DoctorResult> {
     lines.push('fix run cobrowser setup --browser <browser> to install a native host');
     ok = false;
   }
-  const installedExtension = path.join(root, 'extension', 'manifest.json');
-  const sourceExtension = path.join(sourceDist(), 'extension', 'manifest.json');
-  const extension = fs.existsSync(installedExtension) ? installedExtension : sourceExtension;
-  const extensionFiles = [
-    path.join(path.dirname(extension), 'manifest.json'),
-    path.join(path.dirname(extension), 'service-worker.js'),
-    path.join(path.dirname(extension), 'popup.html'),
-    path.join(path.dirname(extension), 'popup.js'),
-    path.join(path.dirname(extension), 'options.html'),
-    path.join(path.dirname(extension), 'options.js'),
-  ];
-  const extensionReady = extensionFiles.every((file) => {
-    try {
-      return fs.statSync(file).isFile();
-    } catch {
-      return false;
-    }
-  });
+  const extension = path.join(root, 'extension', 'manifest.json');
+  let extensionReady = false;
+  try {
+    await validateExtensionBuild(path.dirname(extension));
+    extensionReady = true;
+  } catch {
+    extensionReady = false;
+  }
   let extensionVersion: string | undefined;
   let extensionKey: string | undefined;
   try {
@@ -708,19 +884,15 @@ export async function doctor(): Promise<DoctorResult> {
     extensionVersion = undefined;
     extensionKey = undefined;
   }
-  if (extensionVersion === VERSION && extensionKey === PUBLIC_KEY && extensionReady)
-    lines.push(`ok extension build is present at ${path.dirname(extension)}`);
-  else if (!extensionVersion) {
-    lines.push('fix run npm run build before setup');
-    ok = false;
-  } else if (extensionVersion !== VERSION) {
+  if (extensionReady) lines.push(`ok extension build is present at ${path.dirname(extension)}`);
+  else if (extensionVersion && extensionVersion !== VERSION) {
     lines.push(`fix run cobrowser setup to update the extension to version ${VERSION}`);
     ok = false;
-  } else if (!extensionReady) {
-    lines.push('fix run cobrowser setup to restore the extension files');
+  } else if (extensionKey && extensionKey !== PUBLIC_KEY) {
+    lines.push('fix run cobrowser setup and reload the extension with its stable key');
     ok = false;
   } else {
-    lines.push('fix run cobrowser setup and reload the extension with its stable key');
+    lines.push('fix run cobrowser setup to restore the extension files');
     ok = false;
   }
   const skill = path.join(userHome(), '.agents', 'skills', 'cobrowser', 'SKILL.md');
@@ -729,8 +901,8 @@ export async function doctor(): Promise<DoctorResult> {
     lines.push('fix run cobrowser setup to install the agent skill');
     ok = false;
   }
-  if (!(await checkMcpRegistration('claude', 'claude mcp list', lines))) ok = false;
-  if (!(await checkMcpRegistration('codex', 'codex mcp list', lines))) ok = false;
+  if (!(await checkMcpRegistration('claude', runtime, lines))) ok = false;
+  if (!(await checkMcpRegistration('codex', runtime, lines))) ok = false;
   const run = path.join(root, 'run');
   try {
     const sockets = (await fsp.readdir(run)).filter(
@@ -771,26 +943,9 @@ export async function doctor(): Promise<DoctorResult> {
 }
 
 async function checkMcpRegistration(
-  command: string,
-  listCommand: string,
+  command: AgentCommand,
+  runtime: string,
   lines: string[],
 ): Promise<boolean> {
-  try {
-    await exec('sh', ['-c', `command -v ${command} >/dev/null 2>&1`], { timeout: 2_000 });
-  } catch {
-    return true;
-  }
-  const [name, subcommand, action] = listCommand.split(' ');
-  try {
-    const result = await exec(name, [subcommand, action], { timeout: 5_000 });
-    if (result.stdout.includes('cobrowser')) {
-      lines.push(`ok ${command} MCP registration is present`);
-      return true;
-    }
-    lines.push(`fix run cobrowser setup to register the ${command} MCP server`);
-    return false;
-  } catch {
-    lines.push(`fix run cobrowser setup to register the ${command} MCP server`);
-    return false;
-  }
+  return inspectAgentRegistration(command, runtime, lines);
 }
